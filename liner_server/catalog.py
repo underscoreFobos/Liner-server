@@ -10,8 +10,6 @@ from .config import YTM_LANGUAGE, YTM_LOCATION
 _local = threading.local()
 _pool = ThreadPoolExecutor(max_workers=8)
 
-TOP_CHART_PLAYLIST = "PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i"
-
 
 def yt() -> YTMusic:
     client = getattr(_local, "yt", None)
@@ -286,11 +284,6 @@ def radio(track_id: str, limit: int = 25, exclude: set[str] | None = None) -> li
         return []
     skip = set(exclude or ()) | {track_id}
     return [t for t in tracks_of(raw.get("tracks")) if t["id"] not in skip][:limit]
-
-
-def chart_tracks(limit: int = 50) -> list[dict]:
-    pl = get_playlist(TOP_CHART_PLAYLIST, limit=limit)
-    return (pl or {}).get("tracks", [])[:limit]
 
 
 def ytm_lyrics(track_id: str) -> dict | None:

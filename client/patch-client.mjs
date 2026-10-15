@@ -34,6 +34,23 @@ patch("electron/main.ts", [
   ],
 ]);
 
+patch("src/shared/api/baseUrl.ts", [
+  [
+    `export function switchToFallbackEdge(): boolean {
+  if (currentBaseUrl === DEFAULT_PRIMARY_API) {`,
+    `export function switchToFallbackEdge(): boolean {
+  if (isExplicitCustomOverride(import.meta.env.VITE_API_URL as string | undefined)) return false;
+  if (currentBaseUrl === DEFAULT_PRIMARY_API) {`,
+  ],
+  [
+    `export function switchToPrimaryApi(): void {
+  currentBaseUrl = DEFAULT_PRIMARY_API;`,
+    `export function switchToPrimaryApi(): void {
+  if (isExplicitCustomOverride(import.meta.env.VITE_API_URL as string | undefined)) return;
+  currentBaseUrl = DEFAULT_PRIMARY_API;`,
+  ],
+]);
+
 const pkgPath = path.join(root, "package.json");
 const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
 pkg.productName = "Liner Local";

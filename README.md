@@ -6,7 +6,7 @@ A self-hosted backend for the [Liner desktop client](https://github.com/tryliner
 - **Audio**: downloaded with [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Opus/WebM preferred), cached on disk, served with HTTP range support
 - **Lyrics**: [LRCLIB](https://lrclib.net) and YouTube Music synced lyrics (line-level), streamed as SSE
 - **Accounts, likes, saved albums/artists/playlists, user playlists, history**: local SQLite
-- **Home / recommendations**: local play counts, radio seeded from your history and likes, YouTube top chart as fallback
+- **Recommendations**: a music graph built from YouTube Music radio around every track you like, add to playlists or play; tracks become sparse vectors over that graph plus artist features, your taste vector is a weighted sum of your tracks (likes, playlists, recent plays, skips count against), and candidates are ranked by cosine similarity with MMR diversification. Powers Daily Mixes (clusters of your taste), the endless wave and radio reranking. Popular sections show only real plays on your server
 
 Not implemented: playlist imports, followers, leaderboards (endpoints return empty results), syllable/word-level lyrics.
 

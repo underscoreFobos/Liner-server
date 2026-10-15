@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -11,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import catalog, db, lyrics, media
+from . import catalog, db, lyrics, media, recommender
 from .auth import (
     check_password,
     create_user,
@@ -36,6 +35,9 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 @app.on_event("startup")
 def _startup() -> None:
     db.init()
+    recommender.init()
+    for row in db.all_("SELECT id FROM users"):
+        recommender.refresh_async(row["id"])
 
 
 def fail(status: int, code: str, message: str):
@@ -284,14 +286,21 @@ def get_track(track_id: TrackId, user=Depends(optional_user)):
 
 
 @app.get("/v1/tracks/{track_id}/radio")
-def get_radio(track_id: TrackId, k: int = Query(25, ge=1, le=50)):
-    return {"items": catalog.radio(track_id, max(1, min(k, 50)))}
+def get_radio(track_id: TrackId, k: int = Query(25, ge=1, le=50), user=Depends(optional_user)):
+    tracks = catalog.radio(track_id, 50)
+    return {"items": recommender.rerank_radio(user["id"] if user else None, track_id, tracks, set(), k)}
 
 
 @app.post("/v1/tracks/{track_id}/radio")
-def post_radio(track_id: TrackId, body: dict = Body(default={})):
+def post_radio(track_id: TrackId, body: dict = Body(default={}), user=Depends(optional_user)):
     _, k = page_args(None, body.get("k"), 25, 50)
-    return {"items": catalog.radio(track_id, max(1, min(k, 50)), set(body.get("history") or []))}
+    history = {h for h in body.get("history") or [] if isinstance(h, str)}
+    tracks = catalog.radio(track_id, 50, history)
+    items = recommender.rerank_radio(user["id"] if user else None, track_id, tracks, history, k)
+    if user and len(items) < k:
+        seen = history | {t["id"] for t in items} | {track_id}
+        items += recommender.recommend(user["id"], k - len(items), seen, 0.15)
+    return {"items": items}
 
 
 @app.get("/v1/albums/{album_id}")
@@ -379,6 +388,7 @@ def liked_tracks(limit: str | None = None, cursor: str | None = None, user=Depen
 def like(track_id: TrackId, user=Depends(current_user)):
     resolve_track(track_id)
     db.run("INSERT OR IGNORE INTO likes (user_id, track_id, liked_at) VALUES (?, ?, ?)", user["id"], track_id, now_iso())
+    recommender.ensure_graph([track_id])
     return Response(status_code=204)
 
 
@@ -542,6 +552,7 @@ def add_playlist_track(playlist_id: str, track_id: TrackId, user=Depends(current
         ts,
     )
     touch_playlist(playlist_id)
+    recommender.ensure_graph([track_id])
     count = db.one("SELECT COUNT(*) AS c FROM playlist_items WHERE playlist_id = ?", playlist_id)["c"]
     return {"id": item_id, "track": track, "position": count - 1, "addedAt": ts}
 
@@ -642,11 +653,7 @@ def popular(window: str = "7d", limit: str | None = None, user=Depends(optional_
         limit,
     )
     tracks = [(db.get_track(r["track_id"]), r["plays"], r["listeners"]) for r in rows]
-    tracks = [x for x in tracks if x[0]]
-    if len(tracks) < 10:
-        seen = {t["id"] for t, _, _ in tracks}
-        tracks += [(t, 0, 0) for t in catalog.chart_tracks(limit) if t["id"] not in seen]
-    tracks = tracks[:limit]
+    tracks = [x for x in tracks if x[0]][:limit]
     liked = liked_ids(user, [t["id"] for t, _, _ in tracks])
     items = []
     for idx, (t, plays, listeners) in enumerate(tracks):
@@ -657,68 +664,24 @@ def popular(window: str = "7d", limit: str | None = None, user=Depends(optional_
     return {"window": window, "generatedAt": now_iso(), "items": items}
 
 
-def seed_tracks(user_id: str, n: int = 5) -> list[str]:
-    rows = db.all_(
-        "SELECT track_id, COUNT(*) AS c FROM history WHERE user_id = ? AND skipped = 0 GROUP BY track_id ORDER BY MAX(listened_at) DESC LIMIT ?",
-        user_id,
-        n,
-    )
-    ids = [r["track_id"] for r in rows]
-    if len(ids) < n:
-        ids += [r["track_id"] for r in db.all_("SELECT track_id FROM likes WHERE user_id = ? ORDER BY liked_at DESC LIMIT ?", user_id, n)]
-    return list(dict.fromkeys(ids))[:n]
-
-
 @app.get("/v1/me/recommendations/wave")
-def wave(k: int = Query(25, ge=1, le=50), waveId: str | None = None, user=Depends(current_user)):
-    seeds = seed_tracks(user["id"])
-    if seeds:
-        items = catalog.radio(random.choice(seeds), k, set(seeds))
-        source = "history-seeds"
-    else:
-        items = catalog.chart_tracks(k)
-        source = "popular-fallback"
-    return {"waveId": waveId or "wave_" + uuid.uuid4().hex[:12], "items": items, "source": source, "count": len(items)}
+def wave(k: int = Query(25, ge=1, le=50), waveId: str | None = None, driftRate: float | None = None, temperature: float | None = None, user=Depends(current_user)):
+    wave_id = waveId or "wave_" + uuid.uuid4().hex[:12]
+    temp = min(max(temperature, 0.02), 1.0) if temperature else 0.12
+    items = recommender.wave(user["id"], wave_id, k, temp)
+    return {"waveId": wave_id, "items": items, "source": "recommender-wave" if items else "popular-fallback", "count": len(items)}
 
 
 @app.get("/v1/me/recommendations/daily-mixes")
 def daily_mixes(user=Depends(current_user)):
-    mixes = []
-    for idx, seed in enumerate(seed_tracks(user["id"], 3)):
-        seed_track = db.get_track(seed)
-        tracks = catalog.radio(seed, 25)
-        if not seed_track or not tracks:
-            continue
-        artists = list(dict.fromkeys(a["name"] for t in tracks for a in t.get("artists", [])))[:4]
-        mix = {
-            "id": f"mix_{idx + 1}_{seed}",
-            "title": f"Daily Mix {idx + 1}",
-            "description": ", ".join(artists),
-            "clusterArtists": artists,
-            "trackCount": len(tracks),
-            "tracks": tracks,
-        }
-        if seed_track.get("cover"):
-            mix["cover"] = seed_track["cover"]
-        mixes.append(mix)
-    return {"items": mixes, "generatedAt": now_iso()}
+    return {"items": recommender.daily_mixes(user["id"]), "generatedAt": now_iso()}
 
 
 @app.get("/v1/me/recommendations/taste")
 def taste(user=Depends(current_user)):
-    seeds = [db.get_track(i) for i in seed_tracks(user["id"], 10)]
-    seeds = [s for s in seeds if s]
-    counts: dict[str, int] = {}
-    for s in seeds:
-        for a in s.get("artists", []):
-            counts[a["name"]] = counts.get(a["name"], 0) + 1
+    profile_data = recommender.taste_profile(user["id"])
     skips = db.all_("SELECT track_id FROM history WHERE user_id = ? AND skipped = 1 ORDER BY listened_at DESC LIMIT 20", user["id"])
-    return {
-        "userId": user["id"],
-        "topSeedTracks": seeds,
-        "topArtists": [{"name": n, "score": float(c)} for n, c in sorted(counts.items(), key=lambda x: -x[1])],
-        "recentSkipTrackIds": [r["track_id"] for r in skips],
-    }
+    return {"userId": user["id"], **profile_data, "recentSkipTrackIds": [r["track_id"] for r in skips]}
 
 
 @app.get("/v1/leaderboards/global")

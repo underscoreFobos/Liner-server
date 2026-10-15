@@ -1,9 +1,13 @@
+import re
 import threading
 from pathlib import Path
 
 import yt_dlp
 
 from .config import AUDIO_CACHE_MAX_MB, AUDIO_DIR, JS_RUNTIME
+
+TRACK_ID_PATTERN = r"^[A-Za-z0-9_-]{11}$"
+_TRACK_ID_RE = re.compile(TRACK_ID_PATTERN)
 
 MIME = {".webm": "audio/webm", ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".opus": "audio/ogg"}
 
@@ -17,6 +21,8 @@ def _lock(track_id: str) -> threading.Lock:
 
 
 def cached(track_id: str) -> Path | None:
+    if not _TRACK_ID_RE.match(track_id):
+        return None
     for ext in MIME:
         p = AUDIO_DIR / f"{track_id}{ext}"
         if p.exists() and p.stat().st_size > 0:
@@ -37,6 +43,8 @@ def _evict() -> None:
 
 
 def ensure(track_id: str, prefer: str | None = None) -> Path:
+    if not _TRACK_ID_RE.match(track_id):
+        raise ValueError("invalid track id")
     hit = cached(track_id)
     if hit:
         hit.touch()

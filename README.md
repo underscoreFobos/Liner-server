@@ -29,10 +29,11 @@ It listens on `http://127.0.0.1:1337`. Data (SQLite DB and audio cache) goes to 
 | Variable | Default | |
 |---|---|---|
 | `LINER_HOST` | `127.0.0.1` | use `0.0.0.0` to expose on your LAN |
+| `LINER_ALLOWED_HOSTS` | unset | extra hostnames/IPs clients may use, comma-separated (e.g. your LAN IP); requests with any other `Host` header are rejected |
 | `LINER_PORT` | `1337` | |
 | `LINER_DATA_DIR` | `./data` | |
 | `LINER_AUDIO_CACHE_MB` | `4096` | oldest files are evicted above this |
-| `LINER_ALLOW_REGISTRATION` | `1` | set `0` after creating your account |
+| `LINER_ALLOW_REGISTRATION` | `first` | `first` = only the first account can register, `1` = open, `0` = closed |
 | `LINER_JS_RUNTIME` | `node` | `node` or `deno` |
 | `LINER_YTM_LANGUAGE` / `LINER_YTM_LOCATION` | `en` / unset | YouTube Music locale |
 

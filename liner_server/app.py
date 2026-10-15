@@ -1,13 +1,15 @@
 import asyncio
 import json
 import random
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Annotated
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import catalog, db, lyrics, media
 from .auth import (
@@ -21,16 +23,14 @@ from .auth import (
     public_user,
     user_from_token,
 )
-from .config import ALLOW_REGISTRATION
+from .config import ALLOWED_HOSTS, ALLOW_REGISTRATION
 
 app = FastAPI(title="Liner server")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["x-request-id", "date"],
-)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+TrackId = Annotated[str, Path(pattern=media.TRACK_ID_PATTERN)]
+USERNAME_RE = re.compile(r"^[a-z0-9_.]{3,32}$")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 @app.on_event("startup")
@@ -68,6 +68,44 @@ def with_viewer(tracks: list[dict], user) -> list[dict]:
     return [{**t, "viewer": {"liked": t["id"] in liked}} for t in tracks]
 
 
+def page_args(cursor, limit, default: int = 30, maximum: int = 200) -> tuple[int, int]:
+    try:
+        offset = max(0, int(cursor or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        size = int(limit) if limit is not None else default
+    except (TypeError, ValueError):
+        size = default
+    return offset, max(1, min(size, maximum))
+
+
+def text_field(body: dict, key: str, max_len: int) -> str | None:
+    value = body.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        fail(400, "INVALID_INPUT", f"{key} must be a string")
+    value = value.strip()
+    if len(value) > max_len:
+        fail(400, "INVALID_INPUT", f"{key} is too long")
+    return value
+
+
+def check_username(username: str, user_id: str | None = None) -> str:
+    if not USERNAME_RE.match(username) or username.startswith("usr_"):
+        fail(400, "INVALID_USERNAME", "Username must be 3-32 characters of a-z, 0-9, _ or .")
+    if db.one("SELECT 1 FROM users WHERE username = ? AND id != ?", username, user_id or ""):
+        fail(409, "USERNAME_TAKEN", "Username already taken")
+    return username
+
+
+def registration_open() -> bool:
+    if ALLOW_REGISTRATION == "first":
+        return db.one("SELECT 1 FROM users LIMIT 1") is None
+    return ALLOW_REGISTRATION == "1"
+
+
 def resolve_track(track_id: str) -> dict:
     track = catalog.get_track(track_id)
     if not track:
@@ -82,26 +120,30 @@ def health():
 
 @app.post("/v1/auth/register")
 def register(body: dict = Body(...)):
-    if not ALLOW_REGISTRATION:
+    if not registration_open():
         fail(403, "REGISTRATION_DISABLED", "Registration is disabled on this server")
-    email = (body.get("email") or "").strip().lower()
-    password = body.get("password") or ""
-    username = (body.get("username") or "").strip().lower()
-    if not email or len(password) < 4:
-        fail(400, "INVALID_INPUT", "Email and a password of at least 4 characters are required")
+    email = (text_field(body, "email", 254) or "").lower()
+    password = body.get("password")
+    if not isinstance(password, str):
+        password = ""
+    username = (text_field(body, "username", 32) or "").lower()
+    display_name = text_field(body, "displayName", 64)
+    if not EMAIL_RE.match(email) or not 8 <= len(password) <= 256:
+        fail(400, "INVALID_INPUT", "A valid email and a password of 8-256 characters are required")
     if db.one("SELECT 1 FROM users WHERE email = ?", email):
         fail(409, "EMAIL_TAKEN", "Email already registered")
-    if username and db.one("SELECT 1 FROM users WHERE username = ?", username):
-        fail(409, "USERNAME_TAKEN", "Username already taken")
-    user_id = create_user(email, password, username, body.get("displayName"))
+    if username:
+        check_username(username)
+    user_id = create_user(email, password, username, display_name)
     return issue(user_id)
 
 
 @app.post("/v1/auth/login")
 def login(body: dict = Body(...)):
-    ident = (body.get("email") or "").strip().lower()
-    row = db.one("SELECT * FROM users WHERE email = ? OR username = ?", ident, ident)
-    if not row or not check_password(body.get("password") or "", row["password_hash"]):
+    ident = (text_field(body, "email", 254) or "").lower()
+    password = body.get("password")
+    row = db.one("SELECT * FROM users WHERE email = ?", ident) or db.one("SELECT * FROM users WHERE username = ?", ident)
+    if not row or not isinstance(password, str) or len(password) > 256 or not check_password(password, row["password_hash"]):
         fail(401, "INVALID_CREDENTIALS", "Invalid email or password")
     return issue(row["id"])
 
@@ -136,6 +178,7 @@ def me(user=Depends(current_user)):
 
 
 PROFILE_FIELDS = {"username": "username", "displayName": "display_name", "avatarUrl": "avatar_url", "bio": "bio"}
+PROFILE_LIMITS = {"username": 32, "displayName": 64, "avatarUrl": 2048, "bio": 500}
 SETTING_FIELDS = ("isPublic", "showActivity", "showHistory", "showLikedTracks", "participateLeaderboards")
 
 
@@ -143,12 +186,13 @@ SETTING_FIELDS = ("isPublic", "showActivity", "showHistory", "showLikedTracks", 
 def update_me(body: dict = Body(...), user=Depends(current_user)):
     for key, column in PROFILE_FIELDS.items():
         if key in body:
-            value = body[key]
-            if key == "username" and value:
-                value = value.strip().lower()
-                taken = db.one("SELECT 1 FROM users WHERE username = ? AND id != ?", value, user["id"])
-                if taken:
-                    fail(409, "USERNAME_TAKEN", "Username already taken")
+            value = text_field(body, key, PROFILE_LIMITS[key]) or None
+            if key == "username":
+                if not value:
+                    fail(400, "INVALID_USERNAME", "Username cannot be empty")
+                value = check_username(value.lower(), user["id"])
+            if key == "avatarUrl" and value and not value.startswith(("https://", "http://")):
+                fail(400, "INVALID_INPUT", "avatarUrl must be an http(s) URL")
             db.run(f"UPDATE users SET {column} = ? WHERE id = ?", value, user["id"])
     settings = json.loads(user["settings"] or "{}")
     settings.update({k: bool(body[k]) for k in SETTING_FIELDS if k in body})
@@ -157,7 +201,7 @@ def update_me(body: dict = Body(...), user=Depends(current_user)):
 
 
 def find_user(ident: str):
-    row = db.one("SELECT * FROM users WHERE id = ? OR username = ?", ident, ident.lower())
+    row = db.one("SELECT * FROM users WHERE id = ?", ident) or db.one("SELECT * FROM users WHERE username = ?", ident.lower())
     if not row:
         fail(404, "USER_NOT_FOUND", "User not found")
     return row
@@ -214,7 +258,7 @@ def user_history(ident: str, cursor: str | None = None, limit: str | None = None
     owner = find_user(ident)
     if not visible(owner, viewer, "showHistory"):
         fail(403, "HISTORY_PRIVATE", "This user's history is private")
-    return history_page(owner["id"], cursor, int(limit or 30))
+    return history_page(owner["id"], cursor, limit)
 
 
 @app.get("/v1/search")
@@ -231,7 +275,7 @@ def search(q: str = "", type: str = "all", user=Depends(optional_user)):
 
 
 @app.get("/v1/tracks/{track_id}")
-def get_track(track_id: str, user=Depends(optional_user)):
+def get_track(track_id: TrackId, user=Depends(optional_user)):
     track = resolve_track(track_id)
     details = dict(track)
     if user:
@@ -240,13 +284,13 @@ def get_track(track_id: str, user=Depends(optional_user)):
 
 
 @app.get("/v1/tracks/{track_id}/radio")
-def get_radio(track_id: str, k: int = 25):
+def get_radio(track_id: TrackId, k: int = Query(25, ge=1, le=50)):
     return {"items": catalog.radio(track_id, max(1, min(k, 50)))}
 
 
 @app.post("/v1/tracks/{track_id}/radio")
-def post_radio(track_id: str, body: dict = Body(default={})):
-    k = int(body.get("k") or 25)
+def post_radio(track_id: TrackId, body: dict = Body(default={})):
+    _, k = page_args(None, body.get("k"), 25, 50)
     return {"items": catalog.radio(track_id, max(1, min(k, 50)), set(body.get("history") or []))}
 
 
@@ -278,7 +322,7 @@ def get_catalog_playlist(playlist_id: str, user=Depends(optional_user)):
 
 
 @app.post("/v1/tracks/{track_id}/playback")
-async def create_playback(track_id: str, body: dict = Body(default={})):
+async def create_playback(track_id: TrackId, body: dict = Body(default={}), user=Depends(current_user)):
     try:
         path = await asyncio.to_thread(media.ensure, track_id, body.get("preferredCodec"))
     except Exception as e:
@@ -298,18 +342,15 @@ async def create_playback(track_id: str, body: dict = Body(default={})):
 
 
 @app.get("/v1/playback/{track_id}/media")
-def playback_media(track_id: str):
+def playback_media(track_id: TrackId):
     path = media.cached(track_id)
     if not path:
-        try:
-            path = media.ensure(track_id)
-        except Exception:
-            fail(404, "MEDIA_NOT_FOUND", "Media not found")
+        fail(404, "MEDIA_NOT_FOUND", "Media not found")
     return FileResponse(path, media_type=media.describe(path)["mimeType"])
 
 
 @app.get("/v1/tracks/{track_id}/lyrics")
-async def get_lyrics(track_id: str):
+async def get_lyrics(track_id: TrackId):
     return StreamingResponse(
         lyrics.stream(track_id),
         media_type="text/event-stream",
@@ -318,8 +359,8 @@ async def get_lyrics(track_id: str):
 
 
 @app.get("/v1/me/library/tracks")
-def liked_tracks(limit: int = 100, cursor: str | None = None, user=Depends(current_user)):
-    offset = int(cursor or 0)
+def liked_tracks(limit: str | None = None, cursor: str | None = None, user=Depends(current_user)):
+    offset, limit = page_args(cursor, limit, 100, 500)
     rows = db.all_(
         "SELECT track_id, liked_at FROM likes WHERE user_id = ? ORDER BY liked_at DESC LIMIT ? OFFSET ?",
         user["id"],
@@ -335,14 +376,14 @@ def liked_tracks(limit: int = 100, cursor: str | None = None, user=Depends(curre
 
 
 @app.put("/v1/me/library/tracks/{track_id}")
-def like(track_id: str, user=Depends(current_user)):
+def like(track_id: TrackId, user=Depends(current_user)):
     resolve_track(track_id)
     db.run("INSERT OR IGNORE INTO likes (user_id, track_id, liked_at) VALUES (?, ?, ?)", user["id"], track_id, now_iso())
     return Response(status_code=204)
 
 
 @app.delete("/v1/me/library/tracks/{track_id}")
-def unlike(track_id: str, user=Depends(current_user)):
+def unlike(track_id: TrackId, user=Depends(current_user)):
     db.run("DELETE FROM likes WHERE user_id = ? AND track_id = ?", user["id"], track_id)
     return Response(status_code=204)
 
@@ -485,7 +526,7 @@ def delete_playlist(playlist_id: str, user=Depends(current_user)):
 
 
 @app.post("/v1/me/playlists/{playlist_id}/tracks/{track_id}")
-def add_playlist_track(playlist_id: str, track_id: str, user=Depends(current_user)):
+def add_playlist_track(playlist_id: str, track_id: TrackId, user=Depends(current_user)):
     own_playlist(playlist_id, user)
     track = resolve_track(track_id)
     last = db.one("SELECT MAX(position) AS p FROM playlist_items WHERE playlist_id = ?", playlist_id)
@@ -556,8 +597,8 @@ def playback_event(body: dict = Body(...), user=Depends(current_user)):
     return Response(status_code=204)
 
 
-def history_page(user_id: str, cursor: str | None, limit: int) -> dict:
-    offset = int(cursor or 0)
+def history_page(user_id: str, cursor, limit) -> dict:
+    offset, limit = page_args(cursor, limit)
     rows = db.all_("SELECT * FROM history WHERE user_id = ? ORDER BY listened_at DESC LIMIT ? OFFSET ?", user_id, limit + 1, offset)
     items = []
     for r in rows[:limit]:
@@ -582,7 +623,7 @@ def history_page(user_id: str, cursor: str | None, limit: int) -> dict:
 
 
 @app.get("/v1/me/history")
-def my_history(cursor: str | None = None, limit: int = 30, user=Depends(current_user)):
+def my_history(cursor: str | None = None, limit: str | None = None, user=Depends(current_user)):
     return history_page(user["id"], cursor, limit)
 
 
@@ -590,7 +631,8 @@ WINDOWS = {"24h": 1, "7d": 7, "30d": 30}
 
 
 @app.get("/v1/explore/popular")
-def popular(window: str = "7d", limit: int = 50, user=Depends(optional_user)):
+def popular(window: str = "7d", limit: str | None = None, user=Depends(optional_user)):
+    _, limit = page_args(None, limit, 50, 100)
     since = "0000"
     if window in WINDOWS:
         since = (datetime.now(timezone.utc) - timedelta(days=WINDOWS[window])).isoformat()
@@ -628,7 +670,7 @@ def seed_tracks(user_id: str, n: int = 5) -> list[str]:
 
 
 @app.get("/v1/me/recommendations/wave")
-def wave(k: int = 25, waveId: str | None = None, user=Depends(current_user)):
+def wave(k: int = Query(25, ge=1, le=50), waveId: str | None = None, user=Depends(current_user)):
     seeds = seed_tracks(user["id"])
     if seeds:
         items = catalog.radio(random.choice(seeds), k, set(seeds))

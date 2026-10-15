@@ -1,5 +1,6 @@
 import re
 import threading
+import time
 from pathlib import Path
 
 import yt_dlp
@@ -18,6 +19,9 @@ _locks_guard = threading.Lock()
 
 def _lock(track_id: str) -> threading.Lock:
     with _locks_guard:
+        if len(_locks) > 512:
+            for key in [k for k, v in _locks.items() if not v.locked()]:
+                del _locks[key]
         return _locks.setdefault(track_id, threading.Lock())
 
 
@@ -32,15 +36,24 @@ def cached(track_id: str, codec: str | None = None) -> Path | None:
 
 
 def _evict() -> None:
-    files = sorted(AUDIO_DIR.glob("*.*"), key=lambda p: p.stat().st_atime)
-    total = sum(p.stat().st_size for p in files)
+    now = time.time()
+    media = []
+    for p in AUDIO_DIR.iterdir():
+        if not p.is_file():
+            continue
+        st = p.stat()
+        if p.suffix in MIME:
+            media.append((st.st_atime, st.st_size, p))
+        elif now - st.st_mtime > 3600:
+            p.unlink(missing_ok=True)
+    media.sort(key=lambda x: x[0])
+    total = sum(size for _, size, _ in media)
     limit = AUDIO_CACHE_MAX_MB * 1024 * 1024
-    for p in files:
+    for _, size, p in media:
         if total <= limit:
             break
-        if p.suffix in MIME:
-            total -= p.stat().st_size
-            p.unlink(missing_ok=True)
+        p.unlink(missing_ok=True)
+        total -= size
 
 
 def ensure(track_id: str, prefer: str | None = None) -> Path:
@@ -76,6 +89,7 @@ def ensure(track_id: str, prefer: str | None = None) -> Path:
             except yt_dlp.utils.DownloadError as e:
                 error = e
         if error:
+            _evict()
             raise error
         hit = cached(track_id, codec)
         if not hit:

@@ -63,7 +63,7 @@ import { discordPresence } from "./discord-rpc.js";`,
   [
     `    ipcMain.handle("storage:clear-covers-cache", async () => {`,
     `    ipcMain.handle("discord:set-activity", (_event, activity) => {
-      discordPresence.setActivity(activity && typeof activity === "object" ? activity : null);
+      discordPresence.setActivity(activity);
     });
 
     ipcMain.handle("storage:clear-covers-cache", async () => {`,

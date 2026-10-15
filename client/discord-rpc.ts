@@ -17,6 +17,31 @@ const OP_FRAME = 1;
 const OP_CLOSE = 2;
 const OP_PING = 3;
 const OP_PONG = 4;
+const MAX_FRAME = 64 * 1024;
+const MAX_MS = 24 * 60 * 60 * 1000;
+
+function text(value: unknown, max: number): string {
+  return typeof value === "string" ? value.slice(0, max) : "";
+}
+
+function ms(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return Math.min(Math.max(0, Math.round(n)), MAX_MS);
+}
+
+export function sanitizeActivity(raw: unknown): DiscordActivityInput | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const cover = text(r.coverUrl, 1024);
+  return {
+    title: text(r.title, 256),
+    artist: text(r.artist, 256),
+    album: text(r.album, 256) || undefined,
+    coverUrl: /^https:\/\/[^\s"]+$/.test(cover) ? cover : undefined,
+    durationMs: ms(r.durationMs),
+    positionMs: ms(r.positionMs),
+  };
+}
 
 function pipePaths(): string[] {
   const out: string[] = [];
@@ -60,7 +85,8 @@ class DiscordPresence {
     }
   }
 
-  setActivity(activity: DiscordActivityInput | null): void {
+  setActivity(raw: unknown): void {
+    const activity = sanitizeActivity(raw);
     this.pending = activity;
     this.hasPending = true;
     if (this.ready) {
@@ -139,9 +165,17 @@ class DiscordPresence {
 
   private onData(chunk: Buffer): void {
     this.buffer = Buffer.concat([this.buffer, chunk]);
+    if (this.buffer.length > MAX_FRAME + 8) {
+      this.reset();
+      return;
+    }
     while (this.buffer.length >= 8) {
       const op = this.buffer.readInt32LE(0);
       const len = this.buffer.readInt32LE(4);
+      if (len < 0 || len > MAX_FRAME) {
+        this.reset();
+        return;
+      }
       if (this.buffer.length < 8 + len) return;
       const raw = this.buffer.subarray(8, 8 + len).toString("utf8");
       this.buffer = this.buffer.subarray(8 + len);
@@ -179,9 +213,8 @@ class DiscordPresence {
       if (input.durationMs > 0) {
         activity.timestamps = { start, end: start + input.durationMs };
       }
-      const cover = input.coverUrl && /^https:\/\//.test(input.coverUrl) ? input.coverUrl : undefined;
-      if (cover) {
-        activity.assets = { large_image: cover, large_text: fit(input.album || input.title, "Liner") };
+      if (input.coverUrl) {
+        activity.assets = { large_image: input.coverUrl, large_text: fit(input.album || input.title, "Liner") };
       }
     }
     this.send(OP_FRAME, {

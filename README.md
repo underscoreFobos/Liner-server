@@ -51,6 +51,8 @@ This clones `tryliner/desktop` to `%USERPROFILE%\liner-client`, applies `client/
 
 - points the client at your server
 - disables the background OTA bundle updater and installer auto-update checks (they would pull the official build back in)
+- stops the client from silently switching to the official API when your server is unreachable
+- adds Discord Rich Presence ("Listening to …" with cover art and progress); put `{"clientId": "<your Discord application ID>"}` in `%APPDATA%iner localdiscord.json`
 - renames the app to **Liner Local** so it installs alongside the official app with separate settings
 
 Requires Node.js and pnpm. Create an account from the app's **Create account** tab on first launch.

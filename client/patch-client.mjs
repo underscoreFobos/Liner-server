@@ -51,6 +51,96 @@ patch("src/shared/api/baseUrl.ts", [
   ],
 ]);
 
+fs.copyFileSync(path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "discord-rpc.ts"), path.join(root, "electron", "discord-rpc.ts"));
+console.log("added electron/discord-rpc.ts");
+
+patch("electron/main.ts", [
+  [
+    `import { createSleepBlocker } from "./sleep-blocker.js";`,
+    `import { createSleepBlocker } from "./sleep-blocker.js";
+import { discordPresence } from "./discord-rpc.js";`,
+  ],
+  [
+    `    ipcMain.handle("storage:clear-covers-cache", async () => {`,
+    `    ipcMain.handle("discord:set-activity", (_event, activity) => {
+      discordPresence.setActivity(activity && typeof activity === "object" ? activity : null);
+    });
+
+    ipcMain.handle("storage:clear-covers-cache", async () => {`,
+  ],
+]);
+
+patch("electron/preload.ts", [
+  [
+    `  syncServerTime: (dateHeaderOrMs: string | number) => Promise<number>;`,
+    `  syncServerTime: (dateHeaderOrMs: string | number) => Promise<number>;
+  setDiscordActivity: (activity: {
+    title: string;
+    artist: string;
+    album?: string;
+    coverUrl?: string;
+    durationMs: number;
+    positionMs: number;
+  } | null) => Promise<void>;`,
+  ],
+  [
+    `  syncServerTime: (dateHeaderOrMs) => ipcRenderer.invoke("signer:sync-time", dateHeaderOrMs),`,
+    `  syncServerTime: (dateHeaderOrMs) => ipcRenderer.invoke("signer:sync-time", dateHeaderOrMs),
+  setDiscordActivity: (activity) => ipcRenderer.invoke("discord:set-activity", activity),`,
+  ],
+]);
+
+patch("src/features/player/engine/playerEngine.ts", [
+  [
+    `  private async syncDiscordPresence(
+    _state: PlayerState,
+    _trackChanged: boolean = false,
+  ): Promise<void> {
+  }`,
+    `  private discordAnchor: { at: number; positionMs: number; rate: number } | null = null;
+
+  private async syncDiscordPresence(
+    state: PlayerState,
+    _trackChanged: boolean = false,
+  ): Promise<void> {
+    const bridge = typeof window !== "undefined" ? window.linerElectron : undefined;
+    if (!bridge?.setDiscordActivity) return;
+    const track = state.currentTrack;
+    if (!track || state.status !== "playing") {
+      this.discordAnchor = null;
+      await bridge.setDiscordActivity(null).catch(() => {});
+      return;
+    }
+    const rate = state.playbackRate || 1;
+    this.discordAnchor = { at: Date.now(), positionMs: state.positionMs, rate };
+    await bridge
+      .setDiscordActivity({
+        title: track.title,
+        artist: track.artists,
+        album: track.album?.title,
+        coverUrl: track.coverUrl,
+        durationMs: Math.round((state.durationMs || track.durationMs) / rate),
+        positionMs: Math.round(state.positionMs / rate),
+      })
+      .catch(() => {});
+  }`,
+  ],
+  [
+    `          void this.syncDiscordPresence(state, newTrack);
+          newTrack = false;
+        }`,
+    `          void this.syncDiscordPresence(state, newTrack);
+          newTrack = false;
+        } else if (state.status === "playing" && this.discordAnchor) {
+          const anchor = this.discordAnchor;
+          const expected = anchor.positionMs + (Date.now() - anchor.at) * anchor.rate;
+          if (Math.abs(expected - state.positionMs) > 3000 || (state.playbackRate || 1) !== anchor.rate) {
+            void this.syncDiscordPresence(state);
+          }
+        }`,
+  ],
+]);
+
 const pkgPath = path.join(root, "package.json");
 const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
 pkg.productName = "Liner Local";

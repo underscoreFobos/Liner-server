@@ -163,18 +163,28 @@ def find_user(ident: str):
     return row
 
 
+def visible(row, viewer, setting: str | None = None) -> bool:
+    if viewer and viewer["id"] == row["id"]:
+        return True
+    settings = public_user(row)
+    return bool(settings["isPublic"]) and (setting is None or bool(settings[setting]))
+
+
 @app.get("/v1/users/search")
-def search_users(q: str = ""):
+def search_users(q: str = "", viewer=Depends(optional_user)):
     if not q.strip():
         return []
     like = f"%{q.strip().lower()}%"
     rows = db.all_("SELECT * FROM users WHERE username LIKE ? OR lower(display_name) LIKE ? LIMIT 20", like, like)
-    return [profile(r) for r in rows]
+    return [profile(r, viewer) for r in rows if visible(r, viewer)]
 
 
 @app.get("/v1/users/{ident}")
-def get_user(ident: str):
-    return profile(find_user(ident))
+def get_user(ident: str, viewer=Depends(optional_user)):
+    row = find_user(ident)
+    if not visible(row, viewer):
+        fail(404, "USER_NOT_FOUND", "User not found")
+    return profile(row, viewer)
 
 
 @app.post("/v1/users/{ident}/follow")
@@ -192,14 +202,18 @@ def follows(ident: str):
 @app.get("/v1/users/{ident}/playlists")
 def user_playlists(ident: str, viewer=Depends(optional_user)):
     owner = find_user(ident)
+    if not visible(owner, viewer):
+        fail(404, "USER_NOT_FOUND", "User not found")
     own = viewer and viewer["id"] == owner["id"]
     rows = db.all_("SELECT * FROM playlists WHERE user_id = ? ORDER BY updated_at DESC", owner["id"])
     return {"items": [playlist_json(r, owner) for r in rows if own or r["is_public"]]}
 
 
 @app.get("/v1/users/{ident}/history")
-def user_history(ident: str, cursor: str | None = None, limit: str | None = None):
+def user_history(ident: str, cursor: str | None = None, limit: str | None = None, viewer=Depends(optional_user)):
     owner = find_user(ident)
+    if not visible(owner, viewer, "showHistory"):
+        fail(403, "HISTORY_PRIVATE", "This user's history is private")
     return history_page(owner["id"], cursor, int(limit or 30))
 
 

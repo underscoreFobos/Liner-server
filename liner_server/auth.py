@@ -52,8 +52,10 @@ def public_user(row) -> dict:
     }
 
 
-def profile(row) -> dict:
+def profile(row, viewer=None) -> dict:
     user = public_user(row)
+    if not viewer or viewer["id"] != row["id"]:
+        user.pop("email", None)
     return {
         **user,
         "followersCount": 0,

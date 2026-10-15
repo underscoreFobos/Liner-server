@@ -333,7 +333,8 @@ def get_catalog_playlist(playlist_id: str, user=Depends(optional_user)):
 @app.post("/v1/tracks/{track_id}/playback")
 async def create_playback(track_id: TrackId, body: dict = Body(default={}), user=Depends(current_user)):
     try:
-        path = await asyncio.to_thread(media.ensure, track_id, body.get("preferredCodec"))
+        codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
+        path = await asyncio.to_thread(media.ensure, track_id, codec)
     except Exception as e:
         fail(502, "PLAYBACK_UNAVAILABLE", f"Could not fetch audio: {str(e)[:300]}")
     info = media.describe(path)
@@ -343,7 +344,7 @@ async def create_playback(track_id: TrackId, body: dict = Body(default={}), user
         "sessionId": session_id,
         "playbackId": session_id,
         "trackId": track_id,
-        "streamUrl": f"/v1/playback/{track_id}/media",
+        "streamUrl": f"/v1/playback/{track_id}/media" + (f"?codec={codec}" if codec else ""),
         "expiresAt": expires,
         "transport": "proxy",
         **info,
@@ -351,8 +352,8 @@ async def create_playback(track_id: TrackId, body: dict = Body(default={}), user
 
 
 @app.get("/v1/playback/{track_id}/media")
-def playback_media(track_id: TrackId):
-    path = media.cached(track_id)
+def playback_media(track_id: TrackId, codec: str | None = None):
+    path = media.cached(track_id, codec if codec in ("aac", "opus") else None)
     if not path:
         fail(404, "MEDIA_NOT_FOUND", "Media not found")
     return FileResponse(path, media_type=media.describe(path)["mimeType"])

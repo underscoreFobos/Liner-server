@@ -10,6 +10,7 @@ TRACK_ID_PATTERN = r"^[A-Za-z0-9_-]{11}$"
 _TRACK_ID_RE = re.compile(TRACK_ID_PATTERN)
 
 MIME = {".webm": "audio/webm", ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".opus": "audio/ogg"}
+CODEC_EXTS = {"aac": (".m4a", ".mp4"), "opus": (".webm", ".opus")}
 
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
@@ -20,10 +21,10 @@ def _lock(track_id: str) -> threading.Lock:
         return _locks.setdefault(track_id, threading.Lock())
 
 
-def cached(track_id: str) -> Path | None:
+def cached(track_id: str, codec: str | None = None) -> Path | None:
     if not _TRACK_ID_RE.match(track_id):
         return None
-    for ext in MIME:
+    for ext in CODEC_EXTS.get(codec or "", tuple(MIME)):
         p = AUDIO_DIR / f"{track_id}{ext}"
         if p.exists() and p.stat().st_size > 0:
             return p
@@ -45,16 +46,17 @@ def _evict() -> None:
 def ensure(track_id: str, prefer: str | None = None) -> Path:
     if not _TRACK_ID_RE.match(track_id):
         raise ValueError("invalid track id")
-    hit = cached(track_id)
+    codec = prefer if prefer in CODEC_EXTS else None
+    hit = cached(track_id, codec)
     if hit:
         hit.touch()
         return hit
     with _lock(track_id):
-        hit = cached(track_id)
+        hit = cached(track_id, codec)
         if hit:
             return hit
         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-        fmt = "bestaudio[ext=m4a]/bestaudio" if prefer == "aac" else "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio"
+        fmt = "bestaudio[ext=m4a]" if prefer == "aac" else "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio"
         opts = {
             "format": fmt,
             "outtmpl": str(AUDIO_DIR / "%(id)s.%(ext)s"),
@@ -75,7 +77,7 @@ def ensure(track_id: str, prefer: str | None = None) -> Path:
                 error = e
         if error:
             raise error
-        hit = cached(track_id)
+        hit = cached(track_id, codec)
         if not hit:
             raise RuntimeError("download produced no audio file")
     _evict()

@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
+import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -22,7 +23,7 @@ from .auth import (
     public_user,
     user_from_token,
 )
-from .config import ALLOWED_HOSTS, ALLOW_REGISTRATION
+from .config import ALLOWED_HOSTS, ALLOW_REGISTRATION, LAN_URL
 
 app = FastAPI(title="Liner server")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
@@ -117,7 +118,7 @@ def resolve_track(track_id: str) -> dict:
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, **({"lan": LAN_URL} if LAN_URL else {})}
 
 
 @app.post("/v1/auth/register")
@@ -332,12 +333,22 @@ def get_catalog_playlist(playlist_id: str, user=Depends(optional_user)):
 
 @app.post("/v1/tracks/{track_id}/playback")
 async def create_playback(track_id: TrackId, body: dict = Body(default={}), user=Depends(current_user)):
-    try:
-        codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
-        path = await asyncio.to_thread(media.ensure, track_id, codec)
-    except Exception as e:
-        fail(502, "PLAYBACK_UNAVAILABLE", f"Could not fetch audio: {str(e)[:300]}")
-    info = media.describe(path)
+    codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
+    path = media.cached(track_id, codec)
+    if path:
+        path.touch()
+        info = media.describe(path)
+    else:
+        try:
+            stream = await asyncio.to_thread(media.resolve, track_id, codec)
+            info = media.describe_ext(stream["ext"])
+            media.prefetch(track_id, codec)
+        except Exception:
+            try:
+                path = await asyncio.to_thread(media.ensure, track_id, codec)
+            except Exception as e:
+                fail(502, "PLAYBACK_UNAVAILABLE", f"Could not fetch audio: {str(e)[:300]}")
+            info = media.describe(path)
     session_id = "pb_" + uuid.uuid4().hex[:16]
     expires = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
     return {
@@ -351,12 +362,70 @@ async def create_playback(track_id: TrackId, body: dict = Body(default={}), user
     }
 
 
+@app.post("/v1/tracks/{track_id}/prefetch")
+def prefetch_track(track_id: TrackId, body: dict = Body(default={}), user=Depends(current_user)):
+    codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
+    media.prefetch(track_id, codec)
+    return Response(status_code=204)
+
+
+UPSTREAM_CHUNK = 1024 * 1024
+_upstream = httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10), follow_redirects=True)
+
+
+def _parse_range(header: str | None, size: int) -> tuple[int, int] | None:
+    if not header or not header.startswith("bytes="):
+        return None
+    first = header[6:].split(",")[0].strip()
+    start_s, _, end_s = first.partition("-")
+    if not start_s:
+        length = int(end_s or 0)
+        return max(0, size - length), size - 1
+    start = int(start_s)
+    end = min(int(end_s), size - 1) if end_s else size - 1
+    return start, end
+
+
 @app.get("/v1/playback/{track_id}/media")
-def playback_media(track_id: TrackId, codec: str | None = None):
-    path = media.cached(track_id, codec if codec in ("aac", "opus") else None)
-    if not path:
+async def playback_media(track_id: TrackId, request: Request, codec: str | None = None):
+    codec = codec if codec in ("aac", "opus") else None
+    path = media.cached(track_id, codec)
+    if path:
+        return FileResponse(path, media_type=media.describe(path)["mimeType"])
+    stream = media.stream_info(track_id, codec)
+    if not stream:
         fail(404, "MEDIA_NOT_FOUND", "Media not found")
-    return FileResponse(path, media_type=media.describe(path)["mimeType"])
+    size = stream["size"]
+    try:
+        requested = _parse_range(request.headers.get("range"), size)
+    except ValueError:
+        requested = None
+    start, end = requested or (0, size - 1)
+    if start >= size or start > end:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+
+    async def body():
+        pos = start
+        while pos <= end:
+            chunk_end = min(pos + UPSTREAM_CHUNK - 1, end)
+            headers = {**stream["headers"], "Range": f"bytes={pos}-{chunk_end}"}
+            async with _upstream.stream("GET", stream["url"], headers=headers) as r:
+                if r.status_code not in (200, 206):
+                    media.forget_stream(track_id, codec)
+                    return
+                async for part in r.aiter_bytes():
+                    yield part
+            pos = chunk_end + 1
+
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1), "Cache-Control": "no-store"}
+    if requested:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return StreamingResponse(
+        body(),
+        status_code=206 if requested else 200,
+        media_type=media.describe_ext(stream["ext"])["mimeType"],
+        headers=headers,
+    )
 
 
 @app.get("/v1/tracks/{track_id}/lyrics")

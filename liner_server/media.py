@@ -1,8 +1,10 @@
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
 import yt_dlp
 
 from .config import AUDIO_CACHE_MAX_MB, AUDIO_DIR, JS_RUNTIME
@@ -15,6 +17,11 @@ CODEC_EXTS = {"aac": (".m4a", ".mp4"), "opus": (".webm", ".opus")}
 
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
+_streams: dict[str, dict] = {}
+_streams_guard = threading.Lock()
+_prefetch_pool = ThreadPoolExecutor(max_workers=3)
+_prefetching: set[str] = set()
+STREAM_TTL = 3 * 3600
 
 
 def _lock(track_id: str) -> threading.Lock:
@@ -69,16 +76,7 @@ def ensure(track_id: str, prefer: str | None = None) -> Path:
         if hit:
             return hit
         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-        fmt = "bestaudio[ext=m4a]" if prefer == "aac" else "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio"
-        opts = {
-            "format": fmt,
-            "outtmpl": str(AUDIO_DIR / "%(id)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "noprogress": True,
-            "js_runtimes": {JS_RUNTIME: {"path": None}},
-        }
+        opts = {**_base_opts(prefer), "outtmpl": str(AUDIO_DIR / "%(id)s.%(ext)s")}
         error = None
         for _ in range(3):
             try:
@@ -96,6 +94,103 @@ def ensure(track_id: str, prefer: str | None = None) -> Path:
             raise RuntimeError("download produced no audio file")
     _evict()
     return hit
+
+
+def _base_opts(prefer: str | None) -> dict:
+    fmt = "bestaudio[ext=m4a]" if prefer == "aac" else "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio"
+    return {
+        "format": fmt,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "noprogress": True,
+        "js_runtimes": {JS_RUNTIME: {"path": None}},
+    }
+
+
+def _stream_key(track_id: str, codec: str | None) -> str:
+    return track_id + ":" + (codec or "")
+
+
+def stream_info(track_id: str, codec: str | None) -> dict | None:
+    with _streams_guard:
+        s = _streams.get(_stream_key(track_id, codec))
+    if s and s["expires"] > time.time():
+        return s
+    return None
+
+
+def forget_stream(track_id: str, codec: str | None) -> None:
+    with _streams_guard:
+        _streams.pop(_stream_key(track_id, codec), None)
+
+
+def resolve(track_id: str, codec: str | None) -> dict:
+    if not _TRACK_ID_RE.match(track_id):
+        raise ValueError("invalid track id")
+    hit = stream_info(track_id, codec)
+    if hit:
+        return hit
+    error = None
+    info = None
+    for _ in range(3):
+        try:
+            with yt_dlp.YoutubeDL(_base_opts(codec)) as ydl:
+                info = ydl.extract_info(f"https://music.youtube.com/watch?v={track_id}", download=False)
+            break
+        except yt_dlp.utils.DownloadError as e:
+            error = e
+    if info is None:
+        raise error or RuntimeError("could not resolve stream")
+    headers = dict(info.get("http_headers") or {})
+    size = info.get("filesize")
+    if not size:
+        r = httpx.get(info["url"], headers={**headers, "Range": "bytes=0-0"}, timeout=15)
+        total = r.headers.get("content-range", "").rsplit("/", 1)[-1]
+        size = int(total) if total.isdigit() else None
+    if not size:
+        raise RuntimeError("could not determine stream size")
+    entry = {
+        "url": info["url"],
+        "headers": headers,
+        "size": int(size),
+        "ext": "." + info.get("ext", "m4a"),
+        "expires": time.time() + STREAM_TTL,
+    }
+    with _streams_guard:
+        if len(_streams) > 256:
+            now = time.time()
+            stale = [k for k, v in _streams.items() if v["expires"] < now] or list(_streams)[:64]
+            for key in stale:
+                _streams.pop(key, None)
+        _streams[_stream_key(track_id, codec)] = entry
+    return entry
+
+
+def prefetch(track_id: str, codec: str | None) -> None:
+    if not _TRACK_ID_RE.match(track_id):
+        return
+    key = _stream_key(track_id, codec)
+    if cached(track_id, codec) or key in _prefetching:
+        return
+    _prefetching.add(key)
+
+    def run():
+        try:
+            ensure(track_id, codec)
+        except Exception:
+            pass
+        finally:
+            _prefetching.discard(key)
+
+    _prefetch_pool.submit(run)
+
+
+def describe_ext(suffix: str) -> dict:
+    mime = MIME.get(suffix, "audio/webm")
+    codec = "aac" if mime == "audio/mp4" else "opus"
+    bitrate = 256000 if codec == "aac" else 160000
+    return {"mimeType": mime, "codec": codec, "bitrate": bitrate}
 
 
 def describe(path: Path) -> dict:

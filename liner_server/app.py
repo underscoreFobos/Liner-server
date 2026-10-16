@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 import re
@@ -378,9 +379,19 @@ STREAM_TOKEN_TTL = 6 * 3600
 
 def _stream_secret() -> bytes:
     path = DATA_DIR / "stream.key"
-    if not path.exists():
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(secrets.token_bytes(32))
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, secrets.token_bytes(32))
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        pass
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     return path.read_bytes()
 
 

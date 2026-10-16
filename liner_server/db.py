@@ -85,6 +85,14 @@ CREATE TABLE IF NOT EXISTS lyrics (
     data TEXT NOT NULL,
     fetched_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS covers (
+    user_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    file TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, kind, target_id)
+);
 CREATE INDEX IF NOT EXISTS history_user ON history (user_id, listened_at);
 CREATE INDEX IF NOT EXISTS items_playlist ON playlist_items (playlist_id, position);
 """

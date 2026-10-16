@@ -567,6 +567,20 @@ def playlist_json(row, owner=None) -> dict:
     }
     if row["description"]:
         out["description"] = row["description"]
+    custom = custom_cover(row["user_id"], "playlist", row["id"])
+    if custom:
+        out["cover"] = {"url": cover_url(custom)}
+    track_rows = db.all_("SELECT track_id FROM playlist_items WHERE playlist_id = ? ORDER BY position", row["id"])
+    out["trackCount"] = len(track_rows)
+    mosaic = []
+    for r in track_rows:
+        t = db.get_track(r["track_id"])
+        url = ((t or {}).get("cover") or {}).get("url")
+        if url and url not in mosaic:
+            mosaic.append(url)
+        if len(mosaic) == 4:
+            break
+    out["covers"] = mosaic
     if owner:
         out["owner"] = {
             "id": owner["id"],
@@ -653,6 +667,7 @@ def update_playlist(playlist_id: str, body: dict = Body(...), user=Depends(curre
 @app.delete("/v1/me/playlists/{playlist_id}")
 def delete_playlist(playlist_id: str, user=Depends(current_user)):
     own_playlist(playlist_id, user)
+    drop_cover(user["id"], "playlist", playlist_id)
     db.run("DELETE FROM playlist_items WHERE playlist_id = ?", playlist_id)
     db.run("DELETE FROM playlists WHERE id = ?", playlist_id)
     return Response(status_code=204)
@@ -719,8 +734,8 @@ def playback_event(body: dict = Body(...), user=Depends(current_user)):
         track_id,
         body.get("playbackSessionId"),
         body.get("listeningSessionId"),
-        int(body.get("playedDurationMs") or 0),
-        float(body.get("completionRate") or 0),
+        min(max(int(body.get("playedDurationMs") or 0), 0), 6 * 3600 * 1000),
+        min(max(float(body.get("completionRate") or 0), 0.0), 1.0),
         int(bool(body.get("completed"))),
         int(bool(body.get("skipped"))),
         int(body.get("loopCount") or 0),
@@ -785,6 +800,233 @@ def popular(window: str = "7d", limit: str | None = None, user=Depends(optional_
             item["viewer"] = {"liked": t["id"] in liked}
         items.append(item)
     return {"window": window, "generatedAt": now_iso(), "items": items}
+
+
+COVERS_DIR = DATA_DIR / "covers"
+COVER_FILE_RE = re.compile(r"^[A-Za-z0-9_-]{22}\.(jpg|png)$")
+COVER_KINDS = ("track", "playlist")
+MAX_COVER_BYTES = 4 * 1024 * 1024
+
+
+def cover_url(file: str) -> str:
+    return f"/v1/covers/{file}"
+
+
+def custom_cover(user_id: str, kind: str, target_id: str) -> str | None:
+    row = db.one("SELECT file FROM covers WHERE user_id = ? AND kind = ? AND target_id = ?", user_id, kind, target_id)
+    return row["file"] if row else None
+
+
+def drop_cover(user_id: str, kind: str, target_id: str) -> None:
+    old = custom_cover(user_id, kind, target_id)
+    db.run("DELETE FROM covers WHERE user_id = ? AND kind = ? AND target_id = ?", user_id, kind, target_id)
+    if old and COVER_FILE_RE.match(old):
+        (COVERS_DIR / old).unlink(missing_ok=True)
+
+
+def check_cover_target(kind: str, target_id: str, user) -> None:
+    if kind not in COVER_KINDS:
+        fail(404, "NOT_FOUND", "Unknown cover kind")
+    if kind == "track" and not re.fullmatch(media.TRACK_ID_PATTERN, target_id):
+        fail(400, "INVALID_INPUT", "Invalid track id")
+    if kind == "playlist":
+        own_playlist(target_id, user)
+
+
+@app.get("/v1/me/covers")
+def list_covers(user=Depends(current_user)):
+    rows = db.all_("SELECT kind, target_id, file FROM covers WHERE user_id = ?", user["id"])
+    return {"items": [{"kind": r["kind"], "id": r["target_id"], "url": cover_url(r["file"])} for r in rows]}
+
+
+@app.put("/v1/me/covers/{kind}/{target_id}")
+async def set_cover(kind: str, target_id: str, request: Request, user=Depends(current_user)):
+    check_cover_target(kind, target_id, user)
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > MAX_COVER_BYTES:
+            fail(413, "COVER_TOO_LARGE", "Cover must be 4 MB or smaller")
+    if data[:3] == b"\xff\xd8\xff":
+        ext = "jpg"
+    elif data[:8] == b"\x89PNG\r\n\x1a\n":
+        ext = "png"
+    else:
+        fail(415, "UNSUPPORTED_IMAGE", "Cover must be a JPEG or PNG image")
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    name = secrets.token_urlsafe(16)[:22] + "." + ext
+    (COVERS_DIR / name).write_bytes(bytes(data))
+    drop_cover(user["id"], kind, target_id)
+    db.run("INSERT INTO covers (user_id, kind, target_id, file, updated_at) VALUES (?, ?, ?, ?, ?)", user["id"], kind, target_id, name, now_iso())
+    if kind == "playlist":
+        touch_playlist(target_id)
+    return {"kind": kind, "id": target_id, "url": cover_url(name)}
+
+
+@app.delete("/v1/me/covers/{kind}/{target_id}")
+def delete_cover(kind: str, target_id: str, user=Depends(current_user)):
+    check_cover_target(kind, target_id, user)
+    drop_cover(user["id"], kind, target_id)
+    if kind == "playlist":
+        touch_playlist(target_id)
+    return Response(status_code=204)
+
+
+@app.get("/v1/covers/{file}")
+def get_cover(file: str):
+    if not COVER_FILE_RE.match(file) or not (COVERS_DIR / file).is_file():
+        fail(404, "NOT_FOUND", "Cover not found")
+    return FileResponse(
+        COVERS_DIR / file,
+        media_type="image/jpeg" if file.endswith(".jpg") else "image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+STAT_RANGES = {"7d": 7, "30d": 30, "90d": 90, "365d": 365, "all": None}
+COUNTED_PLAY_MS = 30_000
+
+
+def _parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _streaks(days: set) -> tuple[int, int]:
+    if not days:
+        return 0, 0
+    ordered = sorted(days)
+    longest = run = 1
+    for prev, cur in zip(ordered, ordered[1:]):
+        run = run + 1 if (cur - prev).days == 1 else 1
+        longest = max(longest, run)
+    today = (datetime.now(timezone.utc)).date()
+    current = 0
+    day = max(ordered)
+    if (today - day).days <= 1:
+        while day in days:
+            current += 1
+            day -= timedelta(days=1)
+    return current, longest
+
+
+@app.get("/v1/me/stats")
+def my_stats(period: str = Query("30d", alias="range"), tz: int = Query(0, ge=-840, le=840), user=Depends(current_user)):
+    if period not in STAT_RANGES:
+        fail(400, "INVALID_INPUT", "range must be one of " + ", ".join(STAT_RANGES))
+    days = STAT_RANGES[period]
+    offset = timedelta(minutes=tz)
+    now = datetime.now(timezone.utc)
+    since_dt = now - timedelta(days=days) if days else None
+    since = since_dt.isoformat().replace("+00:00", "Z") if since_dt else "0000"
+    all_rows = db.all_(
+        "SELECT track_id, played_ms, completion, completed, skipped, listening_session_id, listened_at FROM history WHERE user_id = ? ORDER BY listened_at",
+        user["id"],
+    )
+    first_heard: dict[str, str] = {}
+    active_days = set()
+    for r in all_rows:
+        first_heard.setdefault(r["track_id"], r["listened_at"])
+        if r["played_ms"] >= 60_000:
+            active_days.add((_parse_ts(r["listened_at"]) + offset).date())
+    rows = [r for r in all_rows if r["listened_at"] >= since]
+    prev_ms = None
+    if since_dt:
+        prev_since = (since_dt - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+        prev_ms = sum(r["played_ms"] for r in all_rows if prev_since <= r["listened_at"] < since)
+
+    tracks: dict[str, dict | None] = {}
+    per_track: dict[str, dict] = {}
+    per_artist: dict[str, dict] = {}
+    by_day: dict[str, int] = {}
+    hours = [0] * 24
+    weekdays = [0] * 7
+    sessions = set()
+    total_ms = plays = skips = completed = 0
+    completion_sum = 0.0
+    for r in rows:
+        ms = max(0, r["played_ms"])
+        total_ms += ms
+        local = _parse_ts(r["listened_at"]) + offset
+        key = local.date().isoformat()
+        by_day[key] = by_day.get(key, 0) + ms
+        hours[local.hour] += ms
+        weekdays[local.weekday()] += ms
+        if r["listening_session_id"]:
+            sessions.add(r["listening_session_id"])
+        counted = ms >= COUNTED_PLAY_MS or r["completed"]
+        plays += 1 if counted else 0
+        skips += 1 if r["skipped"] else 0
+        completed += 1 if r["completed"] else 0
+        completion_sum += r["completion"]
+        tid = r["track_id"]
+        if tid not in tracks:
+            tracks[tid] = db.get_track(tid)
+        t = tracks[tid]
+        if not t:
+            continue
+        pt = per_track.setdefault(tid, {"plays": 0, "ms": 0, "skips": 0})
+        pt["plays"] += 1 if counted else 0
+        pt["ms"] += ms
+        pt["skips"] += 1 if r["skipped"] else 0
+        for artist in t.get("artists") or []:
+            aid = artist.get("id") or artist.get("name")
+            if not aid:
+                continue
+            pa = per_artist.setdefault(aid, {"id": artist.get("id") or "", "name": artist.get("name") or "", "plays": 0, "ms": 0, "tracks": set()})
+            pa["plays"] += 1 if counted else 0
+            pa["ms"] += ms
+            pa["tracks"].add(tid)
+
+    series = []
+    if days and days <= 90:
+        start = (now + offset).date() - timedelta(days=days - 1)
+        for i in range(days):
+            day = (start + timedelta(days=i)).isoformat()
+            series.append({"date": day, "minutes": round(by_day.get(day, 0) / 60000, 1)})
+    else:
+        series = [{"date": k, "minutes": round(v / 60000, 1)} for k, v in sorted(by_day.items())]
+
+    top_tracks = sorted(per_track.items(), key=lambda kv: (kv[1]["plays"], kv[1]["ms"]), reverse=True)[:50]
+    top_artists = sorted(per_artist.values(), key=lambda a: (a["ms"], a["plays"]), reverse=True)[:30]
+    artist_items = []
+    for a in top_artists:
+        entity = db.get_entity("artist", a["id"]) if a["id"] else None
+        item = {"id": a["id"], "name": a["name"], "plays": a["plays"], "minutes": round(a["ms"] / 60000, 1), "tracks": len(a["tracks"])}
+        if entity and entity.get("cover"):
+            item["cover"] = entity["cover"]
+        artist_items.append(item)
+    current_streak, longest_streak = _streaks(active_days)
+    discoveries = sum(1 for tid in per_track if first_heard.get(tid, "") >= since)
+    listened = len(rows)
+    return {
+        "range": period,
+        "generatedAt": now_iso(),
+        "totals": {
+            "minutes": round(total_ms / 60000, 1),
+            "previousMinutes": round(prev_ms / 60000, 1) if prev_ms is not None else None,
+            "plays": plays,
+            "events": listened,
+            "tracks": len(per_track),
+            "artists": len(per_artist),
+            "skips": skips,
+            "completed": completed,
+            "skipRate": round(skips / listened, 3) if listened else 0,
+            "avgCompletion": round(completion_sum / listened, 3) if listened else 0,
+            "sessions": len(sessions),
+            "discoveries": discoveries,
+            "activeDays": len(by_day),
+        },
+        "streak": {"current": current_streak, "longest": longest_streak},
+        "firstListenAt": all_rows[0]["listened_at"] if all_rows else None,
+        "days": series,
+        "hours": [round(v / 60000, 1) for v in hours],
+        "weekdays": [round(v / 60000, 1) for v in weekdays],
+        "topTracks": [
+            {"track": tracks[tid], "plays": v["plays"], "minutes": round(v["ms"] / 60000, 1), "skips": v["skips"]}
+            for tid, v in top_tracks
+        ],
+        "topArtists": artist_items,
+    }
 
 
 @app.get("/v1/me/recommendations/wave")

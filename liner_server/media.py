@@ -21,6 +21,8 @@ _streams: dict[str, dict] = {}
 _streams_guard = threading.Lock()
 _prefetch_pool = ThreadPoolExecutor(max_workers=3)
 _prefetching: set[str] = set()
+_prefetch_guard = threading.Lock()
+MAX_PREFETCH = 24
 STREAM_TTL = 3 * 3600
 
 
@@ -171,9 +173,12 @@ def prefetch(track_id: str, codec: str | None) -> None:
     if not _TRACK_ID_RE.match(track_id):
         return
     key = _stream_key(track_id, codec)
-    if cached(track_id, codec) or key in _prefetching:
+    if cached(track_id, codec):
         return
-    _prefetching.add(key)
+    with _prefetch_guard:
+        if key in _prefetching or len(_prefetching) >= MAX_PREFETCH:
+            return
+        _prefetching.add(key)
 
     def run():
         try:
@@ -181,7 +186,8 @@ def prefetch(track_id: str, codec: str | None) -> None:
         except Exception:
             pass
         finally:
-            _prefetching.discard(key)
+            with _prefetch_guard:
+                _prefetching.discard(key)
 
     _prefetch_pool.submit(run)
 

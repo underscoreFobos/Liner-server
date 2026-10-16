@@ -1,5 +1,9 @@
 import asyncio
+import hashlib
+import hmac
 import json
+import secrets
+import time
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -23,7 +27,7 @@ from .auth import (
     public_user,
     user_from_token,
 )
-from .config import ALLOWED_HOSTS, ALLOW_REGISTRATION, LAN_URL
+from .config import ALLOWED_HOSTS, ALLOW_REGISTRATION, DATA_DIR, LAN_URL
 
 app = FastAPI(title="Liner server")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
@@ -355,7 +359,7 @@ async def create_playback(track_id: TrackId, body: dict = Body(default={}), user
         "sessionId": session_id,
         "playbackId": session_id,
         "trackId": track_id,
-        "streamUrl": f"/v1/playback/{track_id}/media" + (f"?codec={codec}" if codec else ""),
+        "streamUrl": signed_stream_url(track_id, codec),
         "expiresAt": expires,
         "transport": "proxy",
         **info,
@@ -367,6 +371,33 @@ def prefetch_track(track_id: TrackId, body: dict = Body(default={}), user=Depend
     codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
     media.prefetch(track_id, codec)
     return Response(status_code=204)
+
+
+STREAM_TOKEN_TTL = 6 * 3600
+
+
+def _stream_secret() -> bytes:
+    path = DATA_DIR / "stream.key"
+    if not path.exists():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(secrets.token_bytes(32))
+    return path.read_bytes()
+
+
+_STREAM_SECRET = _stream_secret()
+
+
+def _stream_sig(track_id: str, codec: str | None, expires: int) -> str:
+    msg = f"{track_id}:{codec or ''}:{expires}".encode()
+    return hmac.new(_STREAM_SECRET, msg, hashlib.sha256).hexdigest()[:32]
+
+
+def signed_stream_url(track_id: str, codec: str | None) -> str:
+    expires = int(time.time()) + STREAM_TOKEN_TTL
+    query = f"e={expires}&s={_stream_sig(track_id, codec, expires)}"
+    if codec:
+        query = f"codec={codec}&" + query
+    return f"/v1/playback/{track_id}/media?{query}"
 
 
 UPSTREAM_CHUNK = 1024 * 1024
@@ -387,8 +418,10 @@ def _parse_range(header: str | None, size: int) -> tuple[int, int] | None:
 
 
 @app.get("/v1/playback/{track_id}/media")
-async def playback_media(track_id: TrackId, request: Request, codec: str | None = None):
+async def playback_media(track_id: TrackId, request: Request, codec: str | None = None, e: int = 0, s: str = ""):
     codec = codec if codec in ("aac", "opus") else None
+    if e < time.time() or not hmac.compare_digest(s, _stream_sig(track_id, codec, e)):
+        fail(403, "STREAM_TOKEN_INVALID", "Stream link expired or invalid")
     path = media.cached(track_id, codec)
     if path:
         return FileResponse(path, media_type=media.describe(path)["mimeType"])
@@ -410,11 +443,20 @@ async def playback_media(track_id: TrackId, request: Request, codec: str | None 
             chunk_end = min(pos + UPSTREAM_CHUNK - 1, end)
             headers = {**stream["headers"], "Range": f"bytes={pos}-{chunk_end}"}
             async with _upstream.stream("GET", stream["url"], headers=headers) as r:
-                if r.status_code not in (200, 206):
+                if r.status_code != 206 or not r.headers.get("content-range", "").startswith(f"bytes {pos}-"):
                     media.forget_stream(track_id, codec)
-                    return
+                    raise RuntimeError("upstream range mismatch")
+                want = chunk_end - pos + 1
+                sent = 0
                 async for part in r.aiter_bytes():
+                    if sent + len(part) > want:
+                        part = part[: want - sent]
+                    sent += len(part)
                     yield part
+                    if sent >= want:
+                        break
+                if sent < want:
+                    raise RuntimeError("upstream ended early")
             pos = chunk_end + 1
 
     headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1), "Cache-Control": "no-store"}

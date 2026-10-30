@@ -6,6 +6,7 @@ A self-hosted backend for the [Liner desktop client](https://github.com/tryliner
 - **Audio**: downloaded with [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Opus/WebM preferred), cached on disk, served with HTTP range support
 - **Lyrics**: [LRCLIB](https://lrclib.net) and YouTube Music synced lyrics (line-level), streamed as SSE
 - **Accounts, likes, saved albums/artists/playlists, user playlists, history**: local SQLite
+- **Your own songs**: `POST /v1/me/uploads?filename=<name>` with the raw audio file as the body (any format ffmpeg reads). Title, artist, album and embedded cover art come from the file's tags (or `Artist - Title` in the filename), audio is stored as AAC `.m4a` in `data/uploads`, and the track is added to your liked songs so every client shows it. `GET /v1/me/uploads` lists them, `PATCH /v1/me/uploads/<id>` (`title`, `artist`, `album`) edits, `DELETE` removes. Uploads also appear first in search results
 - **Recommendations**: a music graph built from YouTube Music radio around every track you like, add to playlists or play; tracks become sparse vectors over that graph plus artist features, your taste vector is a weighted sum of your tracks (likes, playlists, recent plays, skips count against), and candidates are ranked by cosine similarity with MMR diversification. Powers Daily Mixes (clusters of your taste), the endless wave and radio reranking. Popular sections show only real plays on your server
 
 Not implemented: playlist imports, followers, leaderboards (endpoints return empty results), syllable/word-level lyrics.
@@ -14,7 +15,7 @@ Not implemented: playlist imports, followers, leaderboards (endpoints return emp
 
 - Python 3.10+
 - Node.js (yt-dlp uses it to solve YouTube's JS challenges; set `LINER_JS_RUNTIME=deno` to use Deno instead)
-- ffmpeg on `PATH` is recommended
+- ffmpeg and ffprobe on `PATH` (required for uploading your own songs)
 
 ## Run the server
 
@@ -34,6 +35,7 @@ It listens on `http://127.0.0.1:1337`. Data (SQLite DB and audio cache) goes to 
 | `LINER_DATA_DIR` | `./data` | |
 | `LINER_AUDIO_CACHE_MB` | `4096` | oldest files are evicted above this |
 | `LINER_ALLOW_REGISTRATION` | `first` | `first` = only the first account can register, `1` = open, `0` = closed |
+| `LINER_MAX_UPLOAD_MB` | `300` | largest audio file you can upload |
 | `LINER_JS_RUNTIME` | `node` | `node` or `deno` |
 | `LINER_YTM_LANGUAGE` / `LINER_YTM_LOCATION` | `en` / unset | YouTube Music locale |
 

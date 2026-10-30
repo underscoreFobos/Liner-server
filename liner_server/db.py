@@ -93,6 +93,15 @@ CREATE TABLE IF NOT EXISTS covers (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (user_id, kind, target_id)
 );
+CREATE TABLE IF NOT EXISTS uploads (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    file TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    original_name TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS uploads_user ON uploads (user_id, created_at);
 CREATE INDEX IF NOT EXISTS history_user ON history (user_id, listened_at);
 CREATE INDEX IF NOT EXISTS items_playlist ON playlist_items (playlist_id, position);
 """
@@ -155,3 +164,7 @@ def put_entity(kind: str, entity: dict) -> None:
 def get_entity(kind: str, entity_id: str) -> dict | None:
     row = one("SELECT data FROM entities WHERE kind = ? AND id = ?", kind, entity_id)
     return json.loads(row["data"]) if row else None
+
+
+def get_upload(track_id: str):
+    return one("SELECT * FROM uploads WHERE id = ?", track_id)

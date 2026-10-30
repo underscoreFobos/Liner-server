@@ -278,6 +278,8 @@ def get_playlist(playlist_id: str, limit: int = 300) -> dict | None:
 
 
 def radio(track_id: str, limit: int = 25, exclude: set[str] | None = None) -> list[dict]:
+    if db.get_upload(track_id):
+        return []
     try:
         raw = yt().get_watch_playlist(videoId=track_id, radio=True, limit=limit + 5)
     except Exception:
@@ -287,6 +289,8 @@ def radio(track_id: str, limit: int = 25, exclude: set[str] | None = None) -> li
 
 
 def ytm_lyrics(track_id: str) -> dict | None:
+    if db.get_upload(track_id):
+        return None
     try:
         watch = yt().get_watch_playlist(videoId=track_id, limit=1)
         browse_id = watch.get("lyrics")

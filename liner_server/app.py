@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import catalog, db, lyrics, media, recommender
+from . import catalog, db, lyrics, media, recommender, uploads
 from .auth import (
     check_password,
     create_user,
@@ -28,7 +28,7 @@ from .auth import (
     public_user,
     user_from_token,
 )
-from .config import ALLOWED_HOSTS, ALLOW_REGISTRATION, DATA_DIR, LAN_URL
+from .config import ALLOWED_HOSTS, ALLOW_REGISTRATION, COVERS_DIR, DATA_DIR, LAN_URL, MAX_UPLOAD_MB, UPLOADS_DIR
 
 app = FastAPI(title="Liner server")
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
@@ -274,6 +274,9 @@ def search(q: str = "", type: str = "all", user=Depends(optional_user)):
     if not q.strip():
         return {"items": []}
     items = catalog.search(q.strip(), type)
+    if user and type in ("all", "track"):
+        mine = [{**t, "type": "track"} for t in uploads.search(user["id"], q.strip())]
+        items = mine + items
     tracks = [i for i in items if i.get("type") == "track"]
     liked = liked_ids(user, [t["id"] for t in tracks])
     if user:
@@ -294,6 +297,8 @@ def get_track(track_id: TrackId, user=Depends(optional_user)):
 @app.get("/v1/tracks/{track_id}/radio")
 def get_radio(track_id: TrackId, k: int = Query(25, ge=1, le=50), user=Depends(optional_user)):
     tracks = catalog.radio(track_id, 50)
+    if user and not tracks:
+        return {"items": recommender.recommend(user["id"], k, {track_id}, 0.15)}
     return {"items": recommender.rerank_radio(user["id"] if user else None, track_id, tracks, set(), k)}
 
 
@@ -339,7 +344,12 @@ def get_catalog_playlist(playlist_id: str, user=Depends(optional_user)):
 @app.post("/v1/tracks/{track_id}/playback")
 async def create_playback(track_id: TrackId, body: dict = Body(default={}), user=Depends(current_user)):
     codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
-    path = media.cached(track_id, codec)
+    upload = db.get_upload(track_id)
+    if upload:
+        codec = None
+    path = uploads.path_of(upload) if upload else media.cached(track_id, codec)
+    if upload and not path:
+        fail(404, "MEDIA_NOT_FOUND", "Uploaded file is missing")
     if path:
         path.touch()
         info = media.describe(path)
@@ -370,7 +380,8 @@ async def create_playback(track_id: TrackId, body: dict = Body(default={}), user
 @app.post("/v1/tracks/{track_id}/prefetch")
 def prefetch_track(track_id: TrackId, body: dict = Body(default={}), user=Depends(current_user)):
     codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
-    media.prefetch(track_id, codec)
+    if not db.get_upload(track_id):
+        media.prefetch(track_id, codec)
     return Response(status_code=204)
 
 
@@ -433,7 +444,10 @@ async def playback_media(track_id: TrackId, request: Request, codec: str | None 
     codec = codec if codec in ("aac", "opus") else None
     if e < time.time() or not hmac.compare_digest(s, _stream_sig(track_id, codec, e)):
         fail(403, "STREAM_TOKEN_INVALID", "Stream link expired or invalid")
-    path = media.cached(track_id, codec)
+    upload = db.get_upload(track_id)
+    path = uploads.path_of(upload) if upload else media.cached(track_id, codec)
+    if upload and not path:
+        fail(404, "MEDIA_NOT_FOUND", "Media not found")
     if path:
         return FileResponse(path, media_type=media.describe(path)["mimeType"])
     stream = media.stream_info(track_id, codec)
@@ -802,7 +816,6 @@ def popular(window: str = "7d", limit: str | None = None, user=Depends(optional_
     return {"window": window, "generatedAt": now_iso(), "items": items}
 
 
-COVERS_DIR = DATA_DIR / "covers"
 COVER_FILE_RE = re.compile(r"^[A-Za-z0-9_-]{22}\.(jpg|png)$")
 COVER_KINDS = ("track", "playlist")
 MAX_COVER_BYTES = 4 * 1024 * 1024
@@ -881,6 +894,83 @@ def get_cover(file: str):
         media_type="image/jpeg" if file.endswith(".jpg") else "image/png",
         headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
     )
+
+
+def own_upload(track_id: str, user):
+    row = db.get_upload(track_id)
+    if not row or row["user_id"] != user["id"]:
+        fail(404, "UPLOAD_NOT_FOUND", "Upload not found")
+    return row
+
+
+@app.get("/v1/me/uploads")
+def list_uploads(user=Depends(current_user)):
+    rows = db.all_("SELECT id, created_at FROM uploads WHERE user_id = ? ORDER BY created_at DESC", user["id"])
+    tracks = [(db.get_track(r["id"]), r["created_at"]) for r in rows]
+    items = with_viewer([t for t, _ in tracks if t], user)
+    added = {t["id"]: ts for t, ts in tracks if t}
+    return {"items": [{"track": t, "uploadedAt": added[t["id"]]} for t in items]}
+
+
+@app.post("/v1/me/uploads")
+async def create_upload(request: Request, filename: str = Query("", max_length=255), like: bool = True, user=Depends(current_user)):
+    if not uploads.available():
+        fail(501, "UPLOADS_UNAVAILABLE", "ffmpeg and ffprobe are required on the server for uploads")
+    limit = MAX_UPLOAD_MB * 1024 * 1024
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        fail(413, "UPLOAD_TOO_LARGE", f"Files must be {MAX_UPLOAD_MB} MB or smaller")
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    staged = UPLOADS_DIR / (secrets.token_urlsafe(12) + ".part")
+    size = 0
+    try:
+        with staged.open("wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    fail(413, "UPLOAD_TOO_LARGE", f"Files must be {MAX_UPLOAD_MB} MB or smaller")
+                f.write(chunk)
+        if size == 0:
+            fail(400, "INVALID_INPUT", "Empty upload")
+        try:
+            track = await asyncio.to_thread(uploads.ingest, staged, filename, user["id"], now_iso())
+        except uploads.UploadError as e:
+            fail(415, e.code, e.message)
+    finally:
+        staged.unlink(missing_ok=True)
+    if like:
+        db.run("INSERT OR IGNORE INTO likes (user_id, track_id, liked_at) VALUES (?, ?, ?)", user["id"], track["id"], now_iso())
+    return {**track, "viewer": {"liked": like}}
+
+
+@app.patch("/v1/me/uploads/{track_id}")
+def update_upload(track_id: TrackId, body: dict = Body(...), user=Depends(current_user)):
+    own_upload(track_id, user)
+    track = db.get_track(track_id) or fail(404, "UPLOAD_NOT_FOUND", "Upload not found")
+    title = text_field(body, "title", 300)
+    if title:
+        track["title"] = title
+    artist = text_field(body, "artist", 300)
+    if artist is not None:
+        names = [a for a in uploads.ARTIST_SPLIT.split(artist) if a]
+        track["artists"] = [{"id": "", "name": n} for n in names] or [{"id": "", "name": "Unknown artist"}]
+    album = text_field(body, "album", 300)
+    if album is not None:
+        if album:
+            track["album"] = {"id": "", "title": album}
+        else:
+            track.pop("album", None)
+    db.put_track(track)
+    db.run("DELETE FROM lyrics WHERE track_id = ?", track_id)
+    return with_viewer([track], user)[0]
+
+
+@app.delete("/v1/me/uploads/{track_id}")
+def delete_upload(track_id: TrackId, user=Depends(current_user)):
+    row = own_upload(track_id, user)
+    drop_cover(user["id"], "track", track_id)
+    uploads.remove(row)
+    return Response(status_code=204)
 
 
 STAT_RANGES = {"7d": 7, "30d": 30, "90d": 90, "365d": 365, "all": None}

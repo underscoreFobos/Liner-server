@@ -12,6 +12,9 @@ FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 FILE_RE = re.compile(r"^[A-Za-z0-9_-]{11}\.m4a$")
 ARTIST_SPLIT = re.compile(r"\s*(?:;|\x00| / )\s*")
+SAFE_INPUT = ["-protocol_whitelist", "file", "-format_whitelist", "mp3,mov,mp4,m4a,3gp,3g2,mj2,flac,ogg,matroska,webm,wav,w64,aiff,aac,asf,ape,wv,tta,caf,dsf,amr,au,mpc,mpc8,tak,dts,ac3,eac3,truehd,mlp"]
+MAX_DURATION_S = 4 * 3600
+MAX_OUTPUT_BYTES = 600 * 1024 * 1024
 
 
 class UploadError(Exception):
@@ -42,7 +45,7 @@ def path_of(row) -> Path | None:
 def _probe(src: Path) -> dict:
     try:
         out = subprocess.run(
-            [FFPROBE, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(src)],
+            [FFPROBE, "-v", "error", *SAFE_INPUT, "-print_format", "json", "-show_format", "-show_streams", str(src)],
             capture_output=True,
             timeout=60,
             check=True,
@@ -65,7 +68,7 @@ def _tags(info: dict) -> dict[str, str]:
 
 def _transcode(src: Path, dst: Path, audio: dict) -> None:
     codec = ["-c:a", "copy"] if audio.get("codec_name") == "aac" else ["-c:a", "aac", "-b:a", "256k"]
-    cmd = [FFMPEG, "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:a:0", "-vn", "-map_metadata", "-1", *codec, "-movflags", "+faststart", "-f", "mp4", str(dst)]
+    cmd = [FFMPEG, "-nostdin", "-v", "error", "-y", *SAFE_INPUT, "-i", str(src), "-map", "0:a:0", "-vn", "-map_metadata", "-1", *codec, "-fs", str(MAX_OUTPUT_BYTES), "-movflags", "+faststart", "-f", "mp4", str(dst)]
     try:
         subprocess.run(cmd, capture_output=True, timeout=900, check=True)
     except subprocess.SubprocessError:
@@ -79,7 +82,7 @@ def _cover(src: Path, info: dict) -> dict | None:
     COVERS_DIR.mkdir(parents=True, exist_ok=True)
     name = secrets.token_urlsafe(16)[:22] + ".jpg"
     dst = COVERS_DIR / name
-    cmd = [FFMPEG, "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:v:0", "-frames:v", "1", "-vf", "scale='min(1000,iw)':-2", "-q:v", "3", str(dst)]
+    cmd = [FFMPEG, "-nostdin", "-v", "error", "-y", *SAFE_INPUT, "-i", str(src), "-map", "0:v:0", "-frames:v", "1", "-vf", "scale='min(1000,iw)':-2", "-q:v", "3", str(dst)]
     try:
         subprocess.run(cmd, capture_output=True, timeout=60, check=True)
     except subprocess.SubprocessError:
@@ -105,6 +108,12 @@ def ingest(staged: Path, filename: str, user_id: str, now: str) -> dict:
     audio = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), None)
     if not audio:
         raise UploadError("UNSUPPORTED_AUDIO", "This file has no audio track")
+    try:
+        probed = float(info.get("format", {}).get("duration") or audio.get("duration") or 0)
+    except ValueError:
+        probed = 0.0
+    if probed > MAX_DURATION_S:
+        raise UploadError("UPLOAD_TOO_LONG", "Audio must be 4 hours or shorter")
     tags = _tags(info)
     fallback_title, fallback_artist = _title_from_name(filename)
     title = tags.get("title") or fallback_title

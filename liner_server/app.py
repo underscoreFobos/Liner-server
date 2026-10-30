@@ -346,6 +346,7 @@ async def create_playback(track_id: TrackId, body: dict = Body(default={}), user
     codec = body.get("preferredCodec") if body.get("preferredCodec") in ("aac", "opus") else None
     upload = db.get_upload(track_id)
     if upload:
+        own_upload(track_id, user)
         codec = None
     path = uploads.path_of(upload) if upload else media.cached(track_id, codec)
     if upload and not path:

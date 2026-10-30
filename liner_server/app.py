@@ -966,6 +966,32 @@ def update_upload(track_id: TrackId, body: dict = Body(...), user=Depends(curren
     return with_viewer([track], user)[0]
 
 
+@app.put("/v1/me/uploads/{track_id}/cover")
+async def set_upload_cover(track_id: TrackId, request: Request, user=Depends(current_user)):
+    own_upload(track_id, user)
+    track = db.get_track(track_id) or fail(404, "UPLOAD_NOT_FOUND", "Upload not found")
+    data = bytearray()
+    async for chunk in request.stream():
+        data.extend(chunk)
+        if len(data) > MAX_COVER_BYTES:
+            fail(413, "COVER_TOO_LARGE", "Cover must be 4 MB or smaller")
+    if data[:3] == b"\xff\xd8\xff":
+        ext = "jpg"
+    elif data[:8] == b"\x89PNG\r\n\x1a\n":
+        ext = "png"
+    else:
+        fail(415, "UNSUPPORTED_IMAGE", "Cover must be a JPEG or PNG image")
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    name = secrets.token_urlsafe(16)[:22] + "." + ext
+    (COVERS_DIR / name).write_bytes(bytes(data))
+    old = ((track.get("cover") or {}).get("url") or "").rsplit("/", 1)[-1]
+    if COVER_FILE_RE.match(old):
+        (COVERS_DIR / old).unlink(missing_ok=True)
+    track["cover"] = {"url": cover_url(name), "width": 0, "height": 0}
+    db.put_track(track)
+    return with_viewer([track], user)[0]
+
+
 @app.delete("/v1/me/uploads/{track_id}")
 def delete_upload(track_id: TrackId, user=Depends(current_user)):
     row = own_upload(track_id, user)

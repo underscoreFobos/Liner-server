@@ -160,7 +160,7 @@ def remove(row) -> None:
     if p:
         p.unlink(missing_ok=True)
     cover = ((track.get("cover") or {}).get("url") or "").rsplit("/", 1)[-1]
-    if re.fullmatch(r"[A-Za-z0-9_-]{22}\.jpg", cover):
+    if re.fullmatch(r"[A-Za-z0-9_-]{22}\.(jpg|png)", cover):
         (COVERS_DIR / cover).unlink(missing_ok=True)
     db.run("DELETE FROM uploads WHERE id = ?", row["id"])
     db.run("DELETE FROM tracks WHERE id = ?", row["id"])

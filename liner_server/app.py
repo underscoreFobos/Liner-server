@@ -1036,7 +1036,7 @@ def my_stats(period: str = Query("30d", alias="range"), tz: int = Query(0, ge=-8
     since_dt = now - timedelta(days=days) if days else None
     since = since_dt.isoformat().replace("+00:00", "Z") if since_dt else "0000"
     all_rows = db.all_(
-        "SELECT track_id, played_ms, completion, completed, skipped, listening_session_id, listened_at FROM history WHERE user_id = ? ORDER BY listened_at",
+        "SELECT track_id, played_ms, completion, completed, skipped, loop_count, listening_session_id, listened_at FROM history WHERE user_id = ? ORDER BY listened_at",
         user["id"],
     )
     first_heard: dict[str, str] = {}
@@ -1070,8 +1070,8 @@ def my_stats(period: str = Query("30d", alias="range"), tz: int = Query(0, ge=-8
         weekdays[local.weekday()] += ms
         if r["listening_session_id"]:
             sessions.add(r["listening_session_id"])
-        counted = ms >= COUNTED_PLAY_MS or r["completed"]
-        plays += 1 if counted else 0
+        counted = max(1, r["loop_count"] or 0) if (ms >= COUNTED_PLAY_MS or r["completed"]) else 0
+        plays += counted
         skips += 1 if r["skipped"] else 0
         completed += 1 if r["completed"] else 0
         completion_sum += r["completion"]
@@ -1082,7 +1082,7 @@ def my_stats(period: str = Query("30d", alias="range"), tz: int = Query(0, ge=-8
         if not t:
             continue
         pt = per_track.setdefault(tid, {"plays": 0, "ms": 0, "skips": 0})
-        pt["plays"] += 1 if counted else 0
+        pt["plays"] += counted
         pt["ms"] += ms
         pt["skips"] += 1 if r["skipped"] else 0
         for artist in t.get("artists") or []:
@@ -1090,7 +1090,7 @@ def my_stats(period: str = Query("30d", alias="range"), tz: int = Query(0, ge=-8
             if not aid:
                 continue
             pa = per_artist.setdefault(aid, {"id": artist.get("id") or "", "name": artist.get("name") or "", "plays": 0, "ms": 0, "tracks": set()})
-            pa["plays"] += 1 if counted else 0
+            pa["plays"] += counted
             pa["ms"] += ms
             pa["tracks"].add(tid)
 

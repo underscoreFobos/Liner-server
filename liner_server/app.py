@@ -962,8 +962,28 @@ def update_upload(track_id: TrackId, body: dict = Body(...), user=Depends(curren
         else:
             track.pop("album", None)
     db.put_track(track)
-    db.run("DELETE FROM lyrics WHERE track_id = ?", track_id)
+    if not lyrics.manual(track_id):
+        db.run("DELETE FROM lyrics WHERE track_id = ?", track_id)
     return with_viewer([track], user)[0]
+
+
+@app.get("/v1/me/uploads/{track_id}/lyrics")
+def get_upload_lyrics(track_id: TrackId, user=Depends(current_user)):
+    own_upload(track_id, user)
+    return {"content": lyrics.manual(track_id) or ""}
+
+
+@app.put("/v1/me/uploads/{track_id}/lyrics")
+def set_upload_lyrics(track_id: TrackId, body: dict = Body(...), user=Depends(current_user)):
+    own_upload(track_id, user)
+    track = db.get_track(track_id) or fail(404, "UPLOAD_NOT_FOUND", "Upload not found")
+    content = body.get("content")
+    if not isinstance(content, str):
+        fail(400, "INVALID_INPUT", "content must be a string")
+    if len(content) > 100_000:
+        fail(413, "LYRICS_TOO_LARGE", "Lyrics must be 100 KB or smaller")
+    synced = lyrics.set_manual(track, content)
+    return {"content": lyrics.manual(track_id) or "", "synced": synced}
 
 
 @app.put("/v1/me/uploads/{track_id}/cover")

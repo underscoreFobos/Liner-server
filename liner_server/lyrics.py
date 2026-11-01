@@ -80,6 +80,38 @@ async def _lrclib(client: httpx.AsyncClient, track: dict) -> dict | None:
     return None
 
 
+MANUAL = "Your lyrics"
+_LRC_LINE = re.compile(r"^\s*\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]")
+
+
+def manual(track_id: str) -> str | None:
+    row = db.one("SELECT data FROM lyrics WHERE track_id = ?", track_id)
+    if not row:
+        return None
+    for c in json.loads(row["data"]):
+        if c.get("provider") == MANUAL:
+            return c["lyrics"]["content"]
+    return None
+
+
+def set_manual(track: dict, content: str) -> bool:
+    text = content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        db.run("DELETE FROM lyrics WHERE track_id = ?", track["id"])
+        return False
+    lines = [l for l in text.split("\n") if l.strip()]
+    synced = sum(1 for l in lines if _LRC_LINE.match(l)) >= max(1, len(lines) // 2)
+    candidate = _candidate(MANUAL, track, "lrc" if synced else "plain", text, "line_level" if synced else "plain", None)
+    candidate["quality"]["total"] = 100
+    db.run(
+        "INSERT INTO lyrics (track_id, data, fetched_at) VALUES (?, ?, ?) ON CONFLICT(track_id) DO UPDATE SET data = excluded.data, fetched_at = excluded.fetched_at",
+        track["id"],
+        json.dumps([candidate]),
+        time.time(),
+    )
+    return synced
+
+
 def _fmt_ts(ms: int) -> str:
     return f"[{ms // 60000:02d}:{(ms // 1000) % 60:02d}.{(ms % 1000) // 10:02d}]"
 
@@ -116,7 +148,7 @@ async def stream(track_id: str):
         },
     })
     row = db.one("SELECT data, fetched_at FROM lyrics WHERE track_id = ?", track_id)
-    if row and time.time() - row["fetched_at"] < CACHE_TTL:
+    if row and (time.time() - row["fetched_at"] < CACHE_TTL or MANUAL in row["data"]):
         candidates = json.loads(row["data"])
         for c in candidates:
             yield _event({"type": "provider", "provider": c["provider"], "status": "found", "syncLevel": c["syncLevel"], "candidate": c})

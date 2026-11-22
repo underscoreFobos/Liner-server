@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import yt_dlp
 
+from . import fmp4
 from .config import AUDIO_CACHE_MAX_MB, AUDIO_DIR, JS_RUNTIME
 
 TRACK_ID_PATTERN = r"^[A-Za-z0-9_-]{11}$"
@@ -24,6 +25,7 @@ _prefetching: set[str] = set()
 _prefetch_guard = threading.Lock()
 MAX_PREFETCH = 24
 STREAM_TTL = 3 * 3600
+HEAD_BYTES = 64 * 1024
 
 
 def _lock(track_id: str) -> threading.Lock:
@@ -146,17 +148,23 @@ def resolve(track_id: str, codec: str | None) -> dict:
         raise error or RuntimeError("could not resolve stream")
     headers = dict(info.get("http_headers") or {})
     size = info.get("filesize")
-    if not size:
-        r = httpx.get(info["url"], headers={**headers, "Range": "bytes=0-0"}, timeout=15)
+    patches: list[tuple[int, bytes]] = []
+    ext = "." + info.get("ext", "m4a")
+    if not size or MIME.get(ext) == "audio/mp4":
+        r = httpx.get(info["url"], headers={**headers, "Range": f"bytes=0-{HEAD_BYTES - 1}"}, timeout=15)
         total = r.headers.get("content-range", "").rsplit("/", 1)[-1]
-        size = int(total) if total.isdigit() else None
+        if not size:
+            size = int(total) if total.isdigit() else None
+        if r.status_code == 206 and MIME.get(ext) == "audio/mp4":
+            patches = fmp4.header_patches(r.content)
     if not size:
         raise RuntimeError("could not determine stream size")
     entry = {
         "url": info["url"],
         "headers": headers,
         "size": int(size),
-        "ext": "." + info.get("ext", "m4a"),
+        "ext": ext,
+        "patches": patches,
         "expires": time.time() + STREAM_TTL,
     }
     with _streams_guard:

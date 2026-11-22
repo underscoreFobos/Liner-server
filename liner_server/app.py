@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import catalog, db, lyrics, media, recommender, uploads
+from . import catalog, db, fmp4, lyrics, media, recommender, uploads
 from .auth import (
     check_password,
     create_user,
@@ -463,6 +463,8 @@ async def playback_media(track_id: TrackId, request: Request, codec: str | None 
     if start >= size or start > end:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
 
+    patches = stream.get("patches") or []
+
     async def body():
         pos = start
         while pos <= end:
@@ -477,6 +479,8 @@ async def playback_media(track_id: TrackId, request: Request, codec: str | None 
                 async for part in r.aiter_bytes():
                     if sent + len(part) > want:
                         part = part[: want - sent]
+                    if patches:
+                        part = fmp4.apply(part, pos + sent, patches)
                     sent += len(part)
                     yield part
                     if sent >= want:

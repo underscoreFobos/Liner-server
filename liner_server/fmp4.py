@@ -65,10 +65,14 @@ def header_patches(head: bytes) -> list[tuple[int, bytes]]:
         return []
     patches: list[tuple[int, bytes]] = []
 
-    def walk(start: int, end: int) -> None:
+    def walk(start: int, end: int, depth: int) -> None:
+        if depth >= 6:
+            return
         for kind, p, h, s in _boxes(head, start, end):
+            if s - h < 8:
+                continue
             if kind in CONTAINERS:
-                walk(p + h, p + s)
+                walk(p + h, p + s, depth + 1)
             elif kind == b"elst":
                 patches.extend(_edit_patches(head, p, h, s))
             else:
@@ -76,7 +80,7 @@ def header_patches(head: bytes) -> list[tuple[int, bytes]]:
                 if patch:
                     patches.append(patch)
 
-    walk(pos + header, pos + size)
+    walk(pos + header, pos + size, 0)
     return patches
 
 

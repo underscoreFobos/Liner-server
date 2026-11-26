@@ -1253,7 +1253,7 @@ def _artist_line(entity: dict) -> str:
 def popular_albums(window: str = "7d", limit: str | None = None):
     _, limit = page_args(None, limit, 20, 100)
     rows = db.all_(
-        "SELECT track_id, user_id, COUNT(*) AS plays FROM history WHERE listened_at >= ? GROUP BY track_id, user_id",
+        "SELECT track_id, user_id, COUNT(*) AS plays FROM history WHERE listened_at >= ? GROUP BY track_id, user_id ORDER BY plays DESC LIMIT 2000",
         _since(window),
     )
     albums: dict[str, dict] = {}

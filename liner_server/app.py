@@ -175,6 +175,15 @@ def logout(body: dict = Body(default={})):
     return Response(status_code=204)
 
 
+@app.get("/v1/auth/username-available")
+def username_available(username: str = ""):
+    name = username.strip().lower()
+    if not USERNAME_RE.match(name) or name.startswith("usr_"):
+        return {"username": name, "valid": False, "available": False}
+    taken = db.one("SELECT 1 FROM users WHERE username = ?", name) is not None
+    return {"username": name, "valid": True, "available": not taken}
+
+
 @app.get("/v1/auth/session")
 def session(user=Depends(current_user)):
     return {"user": public_user(user)}
@@ -367,11 +376,14 @@ async def create_playback(track_id: TrackId, body: dict = Body(default={}), user
             info = media.describe(path)
     session_id = "pb_" + uuid.uuid4().hex[:16]
     expires = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+    stream_url = signed_stream_url(track_id, codec)
     return {
         "sessionId": session_id,
         "playbackId": session_id,
         "trackId": track_id,
-        "streamUrl": signed_stream_url(track_id, codec),
+        "streamUrl": stream_url,
+        "url": stream_url,
+        "size": path.stat().st_size if path else 0,
         "expiresAt": expires,
         "transport": "proxy",
         **info,
@@ -1211,3 +1223,119 @@ async def ping_ws(ws: WebSocket):
                 await ws.send_text("p")
     except WebSocketDisconnect:
         pass
+
+
+app.add_api_route("/v1/catalog/search", search, methods=["GET"])
+app.add_api_route("/v1/catalog/tracks/{track_id}", get_track, methods=["GET"])
+app.add_api_route("/v1/catalog/albums/{album_id}", get_album, methods=["GET"])
+app.add_api_route("/v1/catalog/artists/{artist_id}", get_artist, methods=["GET"])
+app.add_api_route("/v1/catalog/playlists/{playlist_id}", get_catalog_playlist, methods=["GET"])
+
+
+def _since(window: str) -> str:
+    if window in WINDOWS:
+        return (datetime.now(timezone.utc) - timedelta(days=WINDOWS[window])).isoformat()
+    return "0000"
+
+
+def _cover_url(entity: dict) -> str | None:
+    c = entity.get("cover")
+    if isinstance(c, dict):
+        return c.get("url")
+    return c if isinstance(c, str) else None
+
+
+def _artist_line(entity: dict) -> str:
+    return ", ".join(a.get("name", "") for a in entity.get("artists") or [] if a.get("name"))
+
+
+@app.get("/v1/explore/popular/albums")
+def popular_albums(window: str = "7d", limit: str | None = None):
+    _, limit = page_args(None, limit, 20, 100)
+    rows = db.all_(
+        "SELECT track_id, user_id, COUNT(*) AS plays FROM history WHERE listened_at >= ? GROUP BY track_id, user_id",
+        _since(window),
+    )
+    albums: dict[str, dict] = {}
+    tracks: dict[str, dict | None] = {}
+    for row in rows:
+        if row["track_id"] not in tracks:
+            tracks[row["track_id"]] = db.get_track(row["track_id"])
+        track = tracks[row["track_id"]]
+        album_ref = (track or {}).get("album") or {}
+        album_id = album_ref.get("id")
+        if not album_id:
+            continue
+        entry = albums.setdefault(album_id, {"plays": 0, "listeners": set(), "track_ids": set(), "track": track, "ref": album_ref})
+        entry["plays"] += row["plays"]
+        entry["listeners"].add(row["user_id"])
+        entry["track_ids"].add(row["track_id"])
+    ranked = sorted(albums.items(), key=lambda kv: kv[1]["plays"], reverse=True)[:limit]
+    items = []
+    for album_id, e in ranked:
+        album = db.get_entity("album", album_id) or {}
+        track = e["track"] or {}
+        artists = album.get("artists") or track.get("artists") or []
+        item = {
+            "id": album_id,
+            "title": album.get("title") or e["ref"].get("title") or "",
+            "artist": ", ".join(a.get("name", "") for a in artists if a.get("name")),
+            "artists": [{"id": a.get("id", ""), "name": a.get("name", "")} for a in artists],
+            "coverUrl": _cover_url(album) or _cover_url(track),
+            "playCount": e["plays"],
+            "uniqueListeners": len(e["listeners"]),
+            "trackCount": album.get("trackCount") or len(e["track_ids"]),
+            "score": float(e["plays"]),
+        }
+        if album.get("year"):
+            item["year"] = album["year"]
+        items.append(item)
+    return {"window": window, "items": items}
+
+
+@app.get("/v1/explore/most-saved")
+def most_saved(type: str = "all", limit: str | None = None):
+    _, limit = page_args(None, limit, 20, 100)
+    kinds = ["album", "playlist"] if type not in ("album", "playlist") else [type]
+    marks = ",".join("?" for _ in kinds)
+    rows = db.all_(
+        f"SELECT kind, entity_id, COUNT(*) AS saves FROM saved WHERE kind IN ({marks}) GROUP BY kind, entity_id ORDER BY saves DESC LIMIT ?",
+        *kinds,
+        limit,
+    )
+    items = []
+    for row in rows:
+        entity = db.get_entity(row["kind"], row["entity_id"])
+        if not entity:
+            continue
+        artists = entity.get("artists") or []
+        items.append({
+            "type": row["kind"],
+            "id": row["entity_id"],
+            "title": entity.get("title") or "",
+            "subtitle": _artist_line(entity) or entity.get("author") or "",
+            "artists": [{"id": a.get("id", ""), "name": a.get("name", "")} for a in artists],
+            "coverUrl": _cover_url(entity),
+            "saves": row["saves"],
+        })
+    return {"type": type if type in ("album", "playlist") else "all", "items": items}
+
+
+@app.get("/v1/me/lyrics/search")
+async def search_lyrics(
+    title: str = Query("", max_length=300),
+    artist: str = Query("", max_length=300),
+    durationMs: int | None = Query(None, ge=0, le=24 * 3600 * 1000),
+    user=Depends(current_user),
+):
+    if not title.strip():
+        fail(400, "INVALID_QUERY", "Title is required")
+    track = {"title": title.strip(), "artists": [{"name": artist.strip()}] if artist.strip() else [], "durationMs": durationMs or 0}
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=lyrics.UA) as client:
+            candidate = await lyrics._lrclib(client, track)
+    except Exception:
+        candidate = None
+    if not candidate:
+        fail(404, "LYRICS_NOT_FOUND", "No lyrics found")
+    return {"provider": candidate["provider"], "cached": False, "candidate": candidate}

@@ -1339,3 +1339,8 @@ async def search_lyrics(
     if not candidate:
         fail(404, "LYRICS_NOT_FOUND", "No lyrics found")
     return {"provider": candidate["provider"], "cached": False, "candidate": candidate}
+
+
+@app.post("/v1/presence/heartbeat")
+def presence_heartbeat(user=Depends(optional_user)):
+    return Response(status_code=204)
